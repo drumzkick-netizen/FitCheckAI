@@ -482,27 +482,62 @@ function parseSingleCombinedResponse(
   let parsed: Record<string, unknown>;
   try {
     parsed = JSON.parse(cleaned) as Record<string, unknown>;
-  } catch {
+  } catch (err) {
     const segment = extractJSONObjectSegment(cleaned);
-    if (!segment) return null;
+    if (!segment) {
+      console.log(`${LOG_PREFIX} parseSingleCombinedResponse: no JSON segment found`, {
+        runId,
+      });
+      return null;
+    }
     try {
       parsed = JSON.parse(segment) as Record<string, unknown>;
-    } catch {
+    } catch (err2) {
+      console.log(`${LOG_PREFIX} parseSingleCombinedResponse: JSON parse failed`, {
+        runId,
+        message: err2 instanceof Error ? err2.message : String(err2),
+      });
       return null;
     }
   }
 
-  const visibleFactsRaw = parsed.visible_facts;
-  let visibleFacts: VisibleFacts = { ...DEFAULT_VISIBLE_FACTS };
-  let visibleFactsFromFallback = true;
-  if (visibleFactsRaw && typeof visibleFactsRaw === "object" && !Array.isArray(visibleFactsRaw)) {
-    visibleFacts = parseVisibleFacts(visibleFactsRaw);
-    visibleFactsFromFallback = false;
+  // Some models may nest the payload under "analysis" or use visibleFacts instead of visible_facts.
+  let root: Record<string, unknown> = parsed;
+  let visibleFactsRaw: unknown =
+    (parsed as Record<string, unknown>).visible_facts ??
+    (parsed as Record<string, unknown>).visibleFacts;
+  if (!visibleFactsRaw && parsed.analysis && typeof parsed.analysis === "object") {
+    root = parsed.analysis as Record<string, unknown>;
+    visibleFactsRaw =
+      (root as Record<string, unknown>).visible_facts ??
+      (root as Record<string, unknown>).visibleFacts;
   }
 
-  const arr = (key: string): string[] =>
-    Array.isArray(parsed[key]) ? (parsed[key] as unknown[]).map(String) : [];
-  return {
+  let visibleFacts: VisibleFacts = { ...DEFAULT_VISIBLE_FACTS };
+  let visibleFactsFromFallback = true;
+  if (visibleFactsRaw) {
+    let candidate: unknown = visibleFactsRaw;
+    if (typeof visibleFactsRaw === "string") {
+      try {
+        candidate = JSON.parse(visibleFactsRaw);
+      } catch {
+        candidate = null;
+      }
+    }
+    if (candidate && typeof candidate === "object" && !Array.isArray(candidate)) {
+      visibleFacts = parseVisibleFacts(candidate);
+      visibleFactsFromFallback = false;
+    }
+  }
+
+  const arr = (key: string): string[] => {
+    const rootValue = (root as Record<string, unknown>)[key];
+    if (Array.isArray(rootValue)) return (rootValue as unknown[]).map(String);
+    const topValue = (parsed as Record<string, unknown>)[key];
+    if (Array.isArray(topValue)) return (topValue as unknown[]).map(String);
+    return [];
+  };
+  const result: SingleCombinedParseResult = {
     visibleFacts,
     visibleFactsFromFallback,
     strengths: arr("strengths"),
@@ -511,6 +546,14 @@ function parseSingleCombinedResponse(
     analysisTips: arr("analysisTips"),
     improvementSuggestions: arr("improvementSuggestions"),
   };
+  console.log(`${LOG_PREFIX} parseSingleCombinedResponse: parsed structure`, {
+    runId,
+    has_visible_facts: !visibleFactsFromFallback,
+    strengths_raw_count: result.strengths.length,
+    improvements_raw_count: result.improvements.length,
+    suggestions_raw_count: result.suggestions.length,
+  });
+  return result;
 }
 
 function classifyEvaluability(facts: VisibleFacts): EvaluabilityState {
@@ -1524,6 +1567,14 @@ export async function analyzePhotoWithAI(
       }
     }
 
+    console.log(`${LOG_PREFIX} feedback counts before filtering`, {
+      purpose,
+      visible_facts_fallback: visibleFactsFromFallback,
+      strengths_raw: strengths.length,
+      improvements_raw: improvements.length,
+      suggestions_raw: suggestions.length,
+    });
+
     const strengthsSanitized = sanitizeFeedbackItems(strengths);
     const improvementsSanitized = sanitizeFeedbackItems(improvements);
     const suggestionsSanitized = sanitizeFeedbackItems(suggestions);
@@ -1546,12 +1597,84 @@ export async function analyzePhotoWithAI(
     suggestionsFiltered = dropBackgroundFocusedWhenVisible(suggestionsFiltered, visibleFacts);
     improvementSuggestionsSanitized = dropBackgroundFocusedWhenVisible(improvementSuggestionsSanitized, visibleFacts);
 
+    console.log(`${LOG_PREFIX} feedback counts after filtering`, {
+      purpose,
+      visible_facts_fallback: visibleFactsFromFallback,
+      strengths_filtered: strengthsFiltered.length,
+      improvements_filtered: improvementsFiltered.length,
+      suggestions_filtered: suggestionsFiltered.length,
+    });
+
     // Visibility comments are only appropriate when the outfit is genuinely hard to judge, and belong in analysisTips.
     const analysisTipsVisibilityFiltered = analysisTipsSanitized.filter((s) => {
       if (!isPhotoCritiqueFeedback(s)) return true;
       return isOutfitVisibilityPoor(visibleFacts);
     });
     const analysisTipsFinal = isOutfitVisibilityPoor(visibleFacts) ? analysisTipsVisibilityFiltered : [];
+
+    // If the outfit is evaluable but all sections are empty after filtering, provide conservative outfit-only fallbacks.
+    const evaluability = classifyEvaluability(visibleFacts);
+    if (evaluability !== "unevaluable") {
+      const allEmpty =
+        strengthsFiltered.length === 0 &&
+        improvementsFiltered.length === 0 &&
+        suggestionsFiltered.length === 0;
+      if (allEmpty) {
+        const fallbackStrengths: string[] = [];
+        const fallbackImprovements: string[] = [];
+        const fallbackSuggestions: string[] = [];
+
+        const silhouetteText = (visibleFacts.silhouette_read ?? "").toLowerCase();
+        const paletteText = (visibleFacts.color_palette_summary ?? "").toLowerCase();
+        const topFit = visibleFacts.top_fit;
+        const bottomFit = visibleFacts.bottom_fit;
+
+        // Strengths: simple, outfit-only positives based on silhouette and palette.
+        if (
+          silhouetteText.includes("streamlined") ||
+          silhouetteText.includes("balanced") ||
+          silhouetteText.includes("clean")
+        ) {
+          fallbackStrengths.push("The overall silhouette reads clean and balanced.");
+        } else if (topFit === "fitted" || bottomFit === "fitted") {
+          fallbackStrengths.push("There is a clear fitted element that helps define your shape.");
+        } else {
+          fallbackStrengths.push("The outfit presents a relaxed, easygoing silhouette.");
+        }
+
+        if (
+          paletteText.includes("cohesive") ||
+          paletteText.includes("harmonious") ||
+          paletteText.includes("tonal") ||
+          paletteText.includes("monochrome") ||
+          paletteText.includes("neutral")
+        ) {
+          fallbackStrengths.push("The color palette feels cohesive and intentional.");
+        }
+
+        // Improvements: gentle, outfit-focused opportunities.
+        if (
+          silhouetteText.includes("boxy") ||
+          silhouetteText.includes("wide") ||
+          silhouetteText.includes("shapeless")
+        ) {
+          fallbackImprovements.push("A bit more shape or structure could help the silhouette feel more intentional.");
+        } else if (topFit === "oversized" || bottomFit === "oversized") {
+          fallbackImprovements.push("Balancing the relaxed fit with one more defined piece could sharpen the look.");
+        } else {
+          fallbackImprovements.push("Clarifying the overall shape a touch more could make the outfit feel more put-together.");
+        }
+
+        // Suggestions: a single conservative styling nudge.
+        fallbackSuggestions.push(
+          "Consider a small styling tweak, like refining proportions or adding a subtle styling detail, to make the outfit feel more intentional."
+        );
+
+        strengthsFiltered = fallbackStrengths;
+        improvementsFiltered = fallbackImprovements;
+        suggestionsFiltered = fallbackSuggestions;
+      }
+    }
 
     const factDrivenResult: AnalysisResponse = {
       isValid: true,
@@ -1600,7 +1723,7 @@ export async function analyzePhotoWithAI(
       purpose,
       subscores: finalResponse.subscores,
       score: finalResponse.score,
-      fromVisibleFactsFallback: debugInfo?.visibleFactsFromFallback ?? false,
+      fromVisibleFactsFallback: visibleFactsFromFallback,
       cacheHitType: debugInfo?.cacheHitType ?? "none",
     });
     console.log(`${LOG_PREFIX} analysis complete`, { purpose, score: finalResponse.score });
