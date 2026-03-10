@@ -5,13 +5,25 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.analyzePhotoWithAI = analyzePhotoWithAI;
 const openai_1 = __importDefault(require("openai"));
+const crypto_1 = __importDefault(require("crypto"));
 const errors_1 = require("../errors");
-const types_1 = require("../types");
 const imageUtils_1 = require("./imageUtils");
 const LOG_PREFIX = "[analyze-photo]";
+const ANALYSIS_DEBUG_ENABLED = process.env.FITCHECK_DEBUG_ANALYSIS === "1" ||
+    process.env.FITCHECK_DEBUG_ANALYSIS === "true";
+/** Temporary debug: force gpt-4o-mini for reliability testing. */
 function getModel() {
-    const env = process.env.OPENAI_MODEL?.trim();
-    return env || "gpt-4o";
+    return "gpt-4o-mini";
+}
+/** Abort OpenAI request after this many ms to avoid hanging; env override allowed. */
+const OPENAI_REQUEST_TIMEOUT_MS = Math.min(60000, Math.max(20000, parseInt(process.env.OPENAI_REQUEST_TIMEOUT_MS || "45000", 10) || 45000));
+function withTimeout(promise, ms, phase) {
+    return new Promise((resolve, reject) => {
+        const t = setTimeout(() => {
+            reject(new errors_1.OpenAIServiceError(`${phase} timed out after ${ms}ms`, 504));
+        }, ms);
+        promise.then((r) => { clearTimeout(t); resolve(r); }).catch((e) => { clearTimeout(t); reject(e); });
+    });
 }
 /** Clamp to 0–10 and round to one decimal place. All scores use this for consistency. */
 function roundToOneDecimal(value) {
@@ -42,75 +54,562 @@ function getFallbackMockResult() {
         strengths: ["Photo received for analysis", "Ready for feedback when AI is available"],
         improvements: ["Connect a valid OpenAI API key for full analysis"],
         suggestions: ["Check your API key in Settings if you expect AI scoring"],
+        analysisTips: ["Connect a valid OpenAI API key for full analysis tips."],
+        improvementSuggestions: [],
+        scoreExplanation: subscores ? deriveScoreExplanation(subscores) : undefined,
     };
 }
-// --- Cheap validation (phase 1): low-detail image, minimal prompt, ~80 tokens out ---
-const VALIDATION_SYSTEM = `Reply with only a JSON object: { "isValid": boolean, "validationMessage": string | null, "reason": string | null }.
-Set isValid to false only if the image is clearly: no person (landscape, food, pet, object, screenshot, meme). Use reason: "no_person_detected" | "outfit_not_visible" | "image_not_relevant" | "framing_too_unclear". If a person is visible or unsure, set isValid true, validationMessage and reason null. No other text.`;
-const VALIDATION_USER = "Is there a clearly visible person in this image suitable for outfit/photo feedback? Reply with the JSON only.";
-// --- Full analysis (phase 2): high-detail image, lean prompt ---
-const CORE_PHILOSOPHY = `
-CORE: This app evaluates the OUTFIT. Outfit quality does NOT require a visible face. Score based on what you can see: clothing, styling, fit, composition, presentation, and photo clarity. Do not penalize a photo just because the face is missing or unclear if the outfit is clearly visible. Strong outfit-focused photos can score well without a visible face. Do not judge personal attractiveness; focus on the outfit and the image. Do not act like every photo must show the face.`;
-function getPurposeFitGuidance(purpose) {
-    if (purpose === "dating") {
-        return `
-PURPOSE-FIT (dating): Face visibility may matter for some dating contexts (connection, profile). Mention it only when genuinely relevant—as a soft, conditional suggestion (e.g. "For dating profiles, a version with your face visible might help connection—outfit itself works well"), not a requirement. Do not lower scores or demand a visible face; a strong outfit-focused photo can still score well for dating.`;
+function logDebugSnapshot(stage, info) {
+    if (!ANALYSIS_DEBUG_ENABLED || !info)
+        return;
+    try {
+        console.log(`${LOG_PREFIX} debug snapshot — ${stage}`, JSON.stringify(info, null, 2));
     }
-    if (purpose === "social" || purpose === "professional") {
-        return `
-PURPOSE-FIT (${purpose}): Mention face visibility only when it is genuinely relevant to the purpose, not as a blanket rule. If the photo works well as an outfit-focused image, say so.`;
+    catch (err) {
+        console.log(`${LOG_PREFIX} debug snapshot logging failed`, {
+            stage,
+            message: err instanceof Error ? err.message : String(err),
+        });
     }
-    return "";
 }
-function getFullAnalysisSystemPrompt(purpose) {
-    const focus = {
-        outfit: "Clothing fit, color, silhouette, style.",
-        dating: "Warmth, approachability, framing. How well the outfit and image work for a dating context.",
-        social: "Impact, composition, shareability.",
-        professional: "Polish, background, presence.",
-        compare: "Presentation, clarity, impact.",
-    };
-    const purposeBlock = getPurposeFitGuidance(purpose);
-    return `Style/photo coach. (1) Validate: isValid true unless clearly no person (landscape, food, pet, object, meme). (2) If valid, score 0.0–10.0 and give feedback.
-${CORE_PHILOSOPHY}
-
-Purpose: ${purpose}. ${focus[purpose]}
-${purposeBlock}
-
-Scoring: Score with nuance based on visible evidence in the image. Use exactly one decimal place for every score. Good examples: 8.1, 8.4, 8.8, 9.2. Do not use extra decimals (e.g. 8.37) or round to whole numbers or .5 unless that truly reflects your assessment. Each of composition, lighting, presentation, purposeFit must be a decimal from 0.0 to 10.0. 9+ rare; 7–8.5 strong; 5.5–6.5 average. Explain score drivers using what you actually see (e.g. why composition is 7.2, why lighting helps or hurts).
-
-FEEDBACK RULES (critical):
-- What Works (strengths): Identify 2–3 strongest positives that are actually visible in the image. Be concrete—e.g. color coordination, clean silhouette, balanced layers, sharper presentation, strong lighting, jacket fits at the shoulders, clean background. Avoid vague praise like "nice outfit" or "good style" unless you immediately add a concrete detail (e.g. "Good style—the layers work well together"). No filler. Sound like a sharp, tasteful evaluator who explains why the score is what it is.
-- Could Improve (improvements): Identify 1–3 biggest weaknesses that materially affect the score. Explain what is reducing the result—e.g. "Lighting is flat on the left side", "Crop cuts off the outfit at the knee", "Background competes for attention". Evidence-based, not generic criticism. Do not repeat the same idea in Suggestions. 1–3 bullets.
-- Suggestions: Give 2–3 practical improvements the user could realistically apply in the next photo or styling attempt. Actionable and easy to act on—e.g. "Try a fill light or shoot near a window", "Crop slightly wider to show the full hem". Do NOT repeat the critique wording from Could Improve; suggest the next step, not the same observation. 2–3 bullets.
-- Do not repeat the same point across strengths, improvements, and suggestions. Each section has a distinct role. Tone: concise, sharp, natural, tasteful. Focus on outfit, style, and photo effectiveness—not personal attractiveness. If the image is strong overall, still include one useful refinement. If the image is weak, still acknowledge any genuine strength. Face visibility: mention only when genuinely relevant to the selected purpose, not as a blanket rule.
-
-Output single JSON only. No markdown.
-{ "isValid": bool, "validationMessage": null|string, "reason": null|"no_person_detected"|"outfit_not_visible"|"image_not_relevant"|"framing_too_unclear", "score": number|null, "subscores": { "composition", "lighting", "presentation", "purposeFit" }|null, "strengths": [], "improvements": [], "suggestions": [] }`;
+const DEFAULT_VISIBLE_FACTS = {
+    person_visible: true,
+    body_crop_type: "unclear",
+    top_type: null,
+    top_fit: "unclear",
+    top_tucked: null,
+    outerwear_visible: null,
+    bottom_type: null,
+    bottom_fit: "unclear",
+    waist_visible: null,
+    waist_definition_visible: null,
+    shoe_visible: null,
+    pant_hem_visible: null,
+    sleeve_visible: null,
+    cuff_visible: null,
+    ear_visibility: "unclear",
+    hair_visibility: null,
+    necklace_visible: null,
+    bracelets_visible: null,
+    watch_visible: null,
+    ring_visible: null,
+    belt_visible: null,
+    accessory_summary: null,
+    color_palette_summary: null,
+    silhouette_read: null,
+    background_simple_or_busy: "unclear",
+    lighting_quality: null,
+    outfit_visibility_quality: null,
+};
+const ANALYSIS_CACHE = new Map();
+const ANALYSIS_CACHE_MAX_ENTRIES = 100;
+function computeImageFingerprint(normalizedBase64) {
+    // Hash the compressed base64 (without data URL prefix) for stability across uploads.
+    const base64 = normalizedBase64.startsWith("data:")
+        ? normalizedBase64.substring(normalizedBase64.indexOf(",") + 1)
+        : normalizedBase64;
+    const hash = crypto_1.default.createHash("sha256");
+    hash.update(base64);
+    return hash.digest("hex").slice(0, 32);
 }
-function clampSubscore(value) {
-    const n = typeof value === "number" ? value : Number(value);
-    if (Number.isNaN(n))
-        return 7;
-    return roundToOneDecimal(n);
+function factsSimilarity(a, b) {
+    let matches = 0;
+    let total = 0;
+    function cmp(av, bv) {
+        total += 1;
+        if (av === bv)
+            matches += 1;
+    }
+    cmp(a.body_crop_type, b.body_crop_type);
+    cmp(a.top_type, b.top_type);
+    cmp(a.top_fit, b.top_fit);
+    cmp(a.top_tucked, b.top_tucked);
+    cmp(a.bottom_type, b.bottom_type);
+    cmp(a.bottom_fit, b.bottom_fit);
+    cmp(a.waist_visible, b.waist_visible);
+    cmp(a.waist_definition_visible, b.waist_definition_visible);
+    cmp(a.shoe_visible, b.shoe_visible);
+    cmp(a.pant_hem_visible, b.pant_hem_visible);
+    cmp(a.sleeve_visible, b.sleeve_visible);
+    cmp(a.cuff_visible, b.cuff_visible);
+    cmp(a.ear_visibility, b.ear_visibility);
+    cmp(a.necklace_visible, b.necklace_visible);
+    cmp(a.bracelets_visible, b.bracelets_visible);
+    cmp(a.watch_visible, b.watch_visible);
+    cmp(a.ring_visible, b.ring_visible);
+    cmp(a.belt_visible, b.belt_visible);
+    cmp(a.background_simple_or_busy, b.background_simple_or_busy);
+    return total === 0 ? 0 : matches / total;
 }
-function parseSubscores(parsed, fallbackScore) {
-    const raw = parsed.subscores;
+function findBestCachedMatch(purpose, facts) {
+    let best = null;
+    let bestSim = 0;
+    const now = Date.now();
+    for (const entry of ANALYSIS_CACHE.values()) {
+        if (entry.purpose !== purpose)
+            continue;
+        const sim = factsSimilarity(facts, entry.visibleFacts);
+        if (sim > bestSim) {
+            bestSim = sim;
+            best = entry;
+        }
+    }
+    if (best && bestSim >= 0.95) {
+        best.lastUsedAt = now;
+        return { entry: best, similarity: bestSim };
+    }
+    return null;
+}
+function putCachedAnalysis(fingerprint, purpose, visibleFacts, response) {
+    const now = Date.now();
+    ANALYSIS_CACHE.set(fingerprint, {
+        fingerprint,
+        purpose,
+        visibleFacts,
+        response,
+        lastUsedAt: now,
+    });
+    if (ANALYSIS_CACHE.size > ANALYSIS_CACHE_MAX_ENTRIES) {
+        // Evict least-recently used entry.
+        let oldestKey = null;
+        let oldestTime = Infinity;
+        for (const [key, entry] of ANALYSIS_CACHE.entries()) {
+            if (entry.lastUsedAt < oldestTime) {
+                oldestTime = entry.lastUsedAt;
+                oldestKey = key;
+            }
+        }
+        if (oldestKey != null) {
+            ANALYSIS_CACHE.delete(oldestKey);
+        }
+    }
+}
+// --- Single-request combined prompt (replaces separate visible-facts + grounded-analysis calls) ---
+const COMBINED_SINGLE_REQUEST_SYSTEM = `You are an outfit analysis assistant. Output ONE JSON object only. No markdown. Evaluate the outfit like a real stylist doing a fit check.
+
+CRITICAL RULE — THIS IS A FIT CHECK, NOT A PHOTO CRITIQUE
+This analysis evaluates the OUTFIT and how it fits the person. Do NOT provide advice about: camera orientation, rotating the image, cropping the image, choosing a different background, using a cleaner background, improving lighting, camera framing, or photography technique. These topics are outside the scope of this app. Only discuss: clothing fit, silhouette, proportion, color coordination, styling, layering, accessories, outfit cohesion. If the outfit is visible enough to judge, completely ignore the background and image quality. Background or photo issues may only be mentioned if the clothing cannot be clearly seen.
+
+FIT-FIRST RULE
+The most important part of the analysis is how the clothing fits and shapes the person. Pay close attention to: whether garments look fitted, relaxed, oversized, boxy, or shapeless; whether the outfit defines or hides shape; whether the silhouette looks balanced or awkward; whether top and bottom proportions work together; whether the outfit reads intentional and put-together or casual/sloppy.
+
+SILHOUETTE RULE
+Explicitly evaluate silhouette and overall visual shape. Consider: waist definition; top-to-bottom balance; whether the outfit looks streamlined or bulky; whether layers improve or hurt the shape; whether the look has structure or feels amorphous. Prioritize silhouette comments over generic comments.
+
+PROPORTION RULE
+Carefully evaluate proportion between visible garments. Examples: fitted top with balanced bottom; oversized top with overly relaxed bottom causing a shapeless look; top length affecting leg line; visual balance between upper and lower body; whether the overall look appears clean, intentional, and proportionate. If proportions are strong, call that out as a strength. If proportions are weak, mention that in improvements or suggestions.
+
+PERSON-FIRST RULE
+Judge how the outfit works ON THE PERSON, not how clothes look in isolation. Focus on: how the clothes sit on the body; whether the outfit flatters the wearer's visible shape; whether the styling enhances the person's overall presentation. Do not just identify garments; interpret how they work together on the person.
+
+BACKGROUND IGNORE RULE
+Ignore the background unless it directly prevents the outfit from being evaluated. Do NOT comment on cluttered rooms, scenery, framing, or lighting unless the outfit cannot be seen. Written feedback stays focused on outfit quality: fit, silhouette, proportion, coordination, styling. Do not drift into camera/photo commentary unless visibility is genuinely poor.
+
+SECTION GUIDANCE
+What Works: Emphasize flattering fit, strong silhouette, clean proportions, cohesive styling, and visible outfit strengths on the person.
+Could Improve: Emphasize weak fit, shapelessness, imbalance, awkward proportion, and visible styling mismatches.
+Suggestions: Suggest ways to improve shape, balance, proportion, styling, or visible coordination. Suggestions should feel like a stylist improving the outfit, not a photographer improving the image.
+
+TONE
+Write like a modern stylist or fit-check expert: concise, visual, outfit-focused, grounded in what is visible, not generic, not overly technical.
+
+1) visible_facts: What is clearly visible. Use exact keys. Booleans: true/false/null (null when area not visible). Enums: use listed values or "unclear". Strings: 1-3 words max.
+Keys: person_visible (boolean), body_crop_type (full_body|upper_body|mid_body|close_crop|unclear), top_type, top_fit (fitted|relaxed|oversized|unclear), top_tucked (bool|null), outerwear_visible, bottom_type, bottom_fit, waist_visible, waist_definition_visible, shoe_visible, pant_hem_visible, sleeve_visible, cuff_visible, ear_visibility (visible|hidden|unclear), hair_visibility, necklace_visible, bracelets_visible, watch_visible, ring_visible, belt_visible, accessory_summary, color_palette_summary, silhouette_read, background_simple_or_busy (simple|busy|unclear), lighting_quality, outfit_visibility_quality.
+
+2) If person_visible is false, set strengths=[], improvements=[], suggestions=[], analysisTips=[], improvementSuggestions=[] and return.
+
+3) STRENGTHS: 2–4 short positives. Emphasize flattering fit, strong silhouette, clean proportions, cohesive styling. Outfit only; no background/scenery/lighting unless visibility is poor.
+
+4) IMPROVEMENTS: 0–3 weaknesses. Emphasize weak fit, shapelessness, imbalance, awkward proportion, styling mismatches. Outfit only; no cleaner background/better lighting/framing unless the outfit cannot be evaluated.
+
+5) SUGGESTIONS: 0–3 actionable tips. Focus on improving shape, balance, proportion, styling, coordination — like a stylist, not a photographer. Do NOT suggest tucking if top already tucked; do NOT suggest adding belt/bracelets/watch/necklace/rings if already visible; do NOT suggest hem/shoe/sleeve changes unless that area is clearly visible.
+
+6) analysisTips: Only when the outfit is hard to evaluate (e.g. too dark, cropped). One short visibility tip if needed. If the outfit is clearly visible, analysisTips must be [].
+
+7) improvementSuggestions: 0–3 outfit-only (same rules as suggestions). No photography or environment advice.`;
+function getCombinedUserPrompt(purpose) {
+    return `Analyze this outfit image. Purpose: ${purpose}. Reply with one JSON: { "visible_facts": {...}, "strengths": [], "improvements": [], "suggestions": [], "analysisTips": [], "improvementSuggestions": [] }.`;
+}
+function coerceBooleanOrNull(value) {
+    if (typeof value === "boolean")
+        return value;
+    if (typeof value === "string") {
+        const v = value.toLowerCase().trim();
+        if (v === "true")
+            return true;
+        if (v === "false")
+            return false;
+    }
+    return null;
+}
+function coerceFit(value) {
+    if (typeof value !== "string")
+        return "unclear";
+    const v = value.toLowerCase().trim();
+    if (v === "fitted")
+        return "fitted";
+    if (v === "relaxed")
+        return "relaxed";
+    if (v === "oversized")
+        return "oversized";
+    return "unclear";
+}
+function coerceBodyCropType(value) {
+    if (typeof value !== "string")
+        return "unclear";
+    const v = value.toLowerCase().trim();
+    if (v === "full_body")
+        return "full_body";
+    if (v === "upper_body")
+        return "upper_body";
+    if (v === "mid_body")
+        return "mid_body";
+    if (v === "close_crop")
+        return "close_crop";
+    return "unclear";
+}
+function coerceTriState(value) {
+    if (typeof value !== "string")
+        return "unclear";
+    const v = value.toLowerCase().trim();
+    if (v === "visible")
+        return "visible";
+    if (v === "hidden")
+        return "hidden";
+    return "unclear";
+}
+function coerceSimpleBackground(value) {
+    if (typeof value !== "string")
+        return "unclear";
+    const v = value.toLowerCase().trim();
+    if (v === "simple")
+        return "simple";
+    if (v === "busy")
+        return "busy";
+    return "unclear";
+}
+function parseVisibleFacts(raw) {
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
-        return subscoresFromScore(fallbackScore);
+        return { ...DEFAULT_VISIBLE_FACTS };
     }
-    const obj = raw;
+    const p = raw;
     return {
-        composition: clampSubscore(obj.composition),
-        lighting: clampSubscore(obj.lighting),
-        presentation: clampSubscore(obj.presentation),
-        purposeFit: clampSubscore(obj.purposeFit),
+        person_visible: typeof p.person_visible === "boolean" ? p.person_visible : true,
+        body_crop_type: coerceBodyCropType(p.body_crop_type),
+        top_type: typeof p.top_type === "string" ? p.top_type : null,
+        top_fit: coerceFit(p.top_fit),
+        top_tucked: coerceBooleanOrNull(p.top_tucked),
+        outerwear_visible: coerceBooleanOrNull(p.outerwear_visible),
+        bottom_type: typeof p.bottom_type === "string" ? p.bottom_type : null,
+        bottom_fit: coerceFit(p.bottom_fit),
+        waist_visible: coerceBooleanOrNull(p.waist_visible),
+        waist_definition_visible: coerceBooleanOrNull(p.waist_definition_visible),
+        shoe_visible: coerceBooleanOrNull(p.shoe_visible),
+        pant_hem_visible: coerceBooleanOrNull(p.pant_hem_visible),
+        sleeve_visible: coerceBooleanOrNull(p.sleeve_visible),
+        cuff_visible: coerceBooleanOrNull(p.cuff_visible),
+        ear_visibility: coerceTriState(p.ear_visibility),
+        hair_visibility: typeof p.hair_visibility === "string" ? p.hair_visibility : null,
+        necklace_visible: coerceBooleanOrNull(p.necklace_visible),
+        bracelets_visible: coerceBooleanOrNull(p.bracelets_visible),
+        watch_visible: coerceBooleanOrNull(p.watch_visible),
+        ring_visible: coerceBooleanOrNull(p.ring_visible),
+        belt_visible: coerceBooleanOrNull(p.belt_visible),
+        accessory_summary: typeof p.accessory_summary === "string" ? p.accessory_summary : null,
+        color_palette_summary: typeof p.color_palette_summary === "string" ? p.color_palette_summary : null,
+        silhouette_read: typeof p.silhouette_read === "string" ? p.silhouette_read : null,
+        background_simple_or_busy: coerceSimpleBackground(p.background_simple_or_busy),
+        lighting_quality: typeof p.lighting_quality === "string" ? p.lighting_quality : null,
+        outfit_visibility_quality: typeof p.outfit_visibility_quality === "string" ? p.outfit_visibility_quality : null,
     };
 }
-/** Compute overall score from subscores (mean), rounded to one decimal, for consistency. */
+function stripMarkdownFences(text) {
+    const trimmed = text.trim();
+    const fenceMatch = trimmed.match(/```[a-zA-Z0-9_-]*\s*([\s\S]*?)```/);
+    if (fenceMatch && fenceMatch[1]) {
+        return fenceMatch[1].trim();
+    }
+    if (trimmed.startsWith("```") && trimmed.endsWith("```")) {
+        return trimmed.slice(3, -3).trim();
+    }
+    return trimmed;
+}
+function extractJSONObjectSegment(text) {
+    const firstBrace = text.indexOf("{");
+    const lastBrace = text.lastIndexOf("}");
+    if (firstBrace === -1 || lastBrace === -1 || lastBrace <= firstBrace) {
+        return null;
+    }
+    return text.slice(firstBrace, lastBrace + 1);
+}
+function parseSingleCombinedResponse(raw, runId) {
+    let cleaned = stripMarkdownFences(raw);
+    let parsed;
+    try {
+        parsed = JSON.parse(cleaned);
+    }
+    catch {
+        const segment = extractJSONObjectSegment(cleaned);
+        if (!segment)
+            return null;
+        try {
+            parsed = JSON.parse(segment);
+        }
+        catch {
+            return null;
+        }
+    }
+    const visibleFactsRaw = parsed.visible_facts;
+    let visibleFacts = { ...DEFAULT_VISIBLE_FACTS };
+    let visibleFactsFromFallback = true;
+    if (visibleFactsRaw && typeof visibleFactsRaw === "object" && !Array.isArray(visibleFactsRaw)) {
+        visibleFacts = parseVisibleFacts(visibleFactsRaw);
+        visibleFactsFromFallback = false;
+    }
+    const arr = (key) => Array.isArray(parsed[key]) ? parsed[key].map(String) : [];
+    return {
+        visibleFacts,
+        visibleFactsFromFallback,
+        strengths: arr("strengths"),
+        improvements: arr("improvements"),
+        suggestions: arr("suggestions"),
+        analysisTips: arr("analysisTips"),
+        improvementSuggestions: arr("improvementSuggestions"),
+    };
+}
+function classifyEvaluability(facts) {
+    if (!facts.person_visible)
+        return "unevaluable";
+    const visibility = (facts.outfit_visibility_quality ?? "").toLowerCase();
+    const crop = facts.body_crop_type;
+    if (visibility.includes("hard to see") ||
+        visibility.includes("very limited") ||
+        visibility.includes("cannot see") ||
+        visibility.includes("barely") ||
+        visibility.includes("poor") ||
+        visibility.includes("unclear")) {
+        return "unevaluable";
+    }
+    if (visibility.includes("partially") ||
+        visibility.includes("some parts") ||
+        crop === "close_crop" ||
+        crop === "mid_body") {
+        return "limited_but_usable";
+    }
+    return "clearly_evaluable";
+}
+/** Weights: fit+proportion 60%, color 25%, occasion 10%, photo clarity 5%. Outfit quality drives the score; photo has minimal impact. */
+const SUBSCORE_WEIGHTS = {
+    composition: 0.60, // fit/tailoring (40%) + proportion/silhouette (20%) — combined as primary
+    presentation: 0.25, // color coordination and palette balance
+    purposeFit: 0.10, // style cohesion and occasion appropriateness
+    lighting: 0.05, // photo clarity only; do not penalize if outfit is visible
+};
+/** Compute overall score from weighted subscores. Outfit (composition, presentation, purposeFit) dominates; lighting is minimal. */
 function overallFromSubscores(subscores) {
-    const mean = (subscores.composition + subscores.lighting + subscores.presentation + subscores.purposeFit) / 4;
-    return roundToOneDecimal(mean);
+    const weighted = subscores.composition * SUBSCORE_WEIGHTS.composition +
+        subscores.presentation * SUBSCORE_WEIGHTS.presentation +
+        subscores.purposeFit * SUBSCORE_WEIGHTS.purposeFit +
+        subscores.lighting * SUBSCORE_WEIGHTS.lighting;
+    return roundToOneDecimal(weighted);
+}
+const SUBSCORE_LABELS = {
+    composition: "fit & proportion",
+    lighting: "photo clarity",
+    presentation: "color coordination",
+    purposeFit: "occasion fit",
+};
+/** One-sentence explanation from subscores: highlight strongest and weakest dimensions. */
+function deriveScoreExplanation(subscores) {
+    const entries = ["composition", "lighting", "presentation", "purposeFit"].map((k) => [k, subscores[k]]);
+    const sorted = [...entries].sort((a, b) => b[1] - a[1]);
+    const [highKey, highVal] = sorted[0];
+    const [lowKey, lowVal] = sorted[3];
+    const highLabel = SUBSCORE_LABELS[highKey];
+    const lowLabel = SUBSCORE_LABELS[lowKey];
+    if (highKey === lowKey || Math.abs(highVal - lowVal) < 0.3) {
+        return `Scores are balanced across ${highLabel} and other factors.`;
+    }
+    const secondLabel = SUBSCORE_LABELS[sorted[1][0]];
+    return `${highLabel} and ${secondLabel} are strongest here, while ${lowLabel} slightly reduces the overall score.`;
+}
+// --- Rule-based subscores from visible facts (Stage 2 inputs) ---
+function clampSubscoreToUserRange(value) {
+    // Allow a wider spread similar to the earlier app feel:
+    // very weak looks can dip toward mid-3s, strong looks can approach mid/high-9s,
+    // but we still avoid extreme 0/10 style scores.
+    const clamped = Math.min(9.4, Math.max(3.5, value));
+    return roundToOneDecimal(clamped);
+}
+function deriveCompositionScore(facts) {
+    // Composition: fit, proportion, silhouette. Start a touch below neutral.
+    let score = 6.5;
+    const visibility = (facts.outfit_visibility_quality ?? "").toLowerCase();
+    // Treat unclear visibility as a modest penalty; lighting handles most photo issues.
+    if (visibility.includes("hard") || visibility.includes("poor") || visibility.includes("unclear")) {
+        score -= 0.4;
+    }
+    // Very tight crops make it harder to judge full outfit balance.
+    if (facts.body_crop_type === "close_crop") {
+        score -= 0.6;
+    }
+    else if (facts.body_crop_type === "mid_body") {
+        score -= 0.3;
+    }
+    // Clear waist definition usually strengthens silhouette.
+    if (facts.waist_definition_visible === true) {
+        score += 0.7;
+    }
+    else if (facts.waist_definition_visible === false) {
+        score -= 0.3;
+    }
+    const silhouette = (facts.silhouette_read ?? "").toLowerCase();
+    if (silhouette.includes("streamlined") ||
+        silhouette.includes("balanced") ||
+        silhouette.includes("clean") ||
+        silhouette.includes("sharp")) {
+        score += 0.9;
+    }
+    else if (silhouette.includes("boxy") ||
+        silhouette.includes("wide") ||
+        silhouette.includes("bulky") ||
+        silhouette.includes("shapeless") ||
+        silhouette.includes("sloppy")) {
+        score -= 1.0;
+    }
+    // Fit descriptors: fitted vs relaxed/oversized.
+    if (facts.top_fit === "fitted") {
+        score += 0.4;
+    }
+    else if (facts.top_fit === "oversized" && !silhouette.includes("intentional")) {
+        score -= 0.5;
+    }
+    if (facts.bottom_fit === "fitted") {
+        score += 0.3;
+    }
+    else if (facts.bottom_fit === "oversized" && !silhouette.includes("intentional")) {
+        score -= 0.3;
+    }
+    // Hoodie / sweatpant combos should realistically score lower on composition.
+    const topType = (facts.top_type ?? "").toLowerCase();
+    const bottomType = (facts.bottom_type ?? "").toLowerCase();
+    const isHoodie = topType.includes("hoodie") || topType.includes("hooded") || topType.includes("sweatshirt");
+    const isSweatpants = bottomType.includes("sweatpant") || bottomType.includes("jogger") || bottomType.includes("track");
+    if (isHoodie) {
+        score -= 0.4;
+    }
+    if (isSweatpants) {
+        score -= 0.5;
+    }
+    if (isHoodie && isSweatpants) {
+        // Very casual / loungewear full outfit — treat as a clearer composition downgrade.
+        score -= 0.4;
+    }
+    // When both top and bottom read relaxed/oversized and silhouette is boxy, treat as a clearer weakness.
+    if ((facts.top_fit === "oversized" || facts.top_fit === "relaxed") &&
+        (facts.bottom_fit === "oversized" || facts.bottom_fit === "relaxed") &&
+        (silhouette.includes("boxy") || silhouette.includes("wide") || silhouette.includes("shapeless"))) {
+        score -= 0.5;
+    }
+    return clampSubscoreToUserRange(score);
+}
+function deriveLightingScore(facts) {
+    // Lighting: photo clarity only. Keep this relatively high and low-impact.
+    let score = 7.4;
+    const visibility = (facts.outfit_visibility_quality ?? "").toLowerCase();
+    if (visibility.includes("hard") || visibility.includes("poor") || visibility.includes("unclear")) {
+        score -= 0.8;
+    }
+    const lighting = (facts.lighting_quality ?? "").toLowerCase();
+    if (lighting.includes("dim") || lighting.includes("harsh") || lighting.includes("backlit")) {
+        score -= 0.6;
+    }
+    else if (lighting.includes("even") || lighting.includes("soft") || lighting.includes("natural")) {
+        score += 0.3;
+    }
+    return clampSubscoreToUserRange(score);
+}
+function derivePresentationScore(facts) {
+    // Presentation: palette cohesion, accessories, background impact.
+    let score = 6.5;
+    const palette = (facts.color_palette_summary ?? "").toLowerCase();
+    if (palette.includes("cohesive") ||
+        palette.includes("harmonious") ||
+        palette.includes("monochrome") ||
+        palette.includes("tonal")) {
+        score += 0.9;
+    }
+    else if (palette.includes("clash") ||
+        palette.includes("busy") ||
+        palette.includes("chaotic") ||
+        palette.includes("muddy")) {
+        score -= 1.0;
+    }
+    const accessoriesText = (facts.accessory_summary ?? "").toLowerCase();
+    const hasAccessories = facts.bracelets_visible === true ||
+        facts.watch_visible === true ||
+        facts.necklace_visible === true ||
+        facts.belt_visible === true ||
+        accessoriesText.length > 0;
+    if (hasAccessories) {
+        score += 0.4;
+    }
+    const background = facts.background_simple_or_busy;
+    if (background === "busy") {
+        // Only penalize if the outfit already reads harder to see.
+        const visibility = (facts.outfit_visibility_quality ?? "").toLowerCase();
+        if (visibility.includes("hard") || visibility.includes("busy") || visibility.includes("unclear")) {
+            score -= 0.5;
+        }
+    }
+    return clampSubscoreToUserRange(score);
+}
+function derivePurposeFitScore(facts, purpose, composition, presentation) {
+    // Purpose fit: how well the look matches its intended use.
+    // Start from an average of composition & presentation, then move more meaningfully based on context.
+    let score = (composition + presentation) / 2;
+    const visibility = (facts.outfit_visibility_quality ?? "").toLowerCase();
+    if (visibility.includes("hard") || visibility.includes("partial") || visibility.includes("unclear")) {
+        score -= 0.5;
+    }
+    const silhouette = (facts.silhouette_read ?? "").toLowerCase();
+    const palette = (facts.color_palette_summary ?? "").toLowerCase();
+    if (purpose === "professional") {
+        // Relaxed/boxy silhouettes read less sharp for professional looks.
+        if (silhouette.includes("boxy") ||
+            silhouette.includes("sloppy") ||
+            facts.top_fit === "oversized" ||
+            facts.bottom_fit === "oversized") {
+            score -= 0.7;
+        }
+        if (palette.includes("cohesive") || palette.includes("neutral") || palette.includes("tonal")) {
+            score += 0.5;
+        }
+    }
+    else if (purpose === "dating" || purpose === "social") {
+        // For dating/social, cohesive or intentional color and a clean silhouette can push purposeFit up.
+        if (silhouette.includes("streamlined") ||
+            silhouette.includes("balanced") ||
+            silhouette.includes("clean")) {
+            score += 0.5;
+        }
+        if (palette.includes("cohesive") || palette.includes("harmonious") || palette.includes("bold")) {
+            score += 0.4;
+        }
+    }
+    else if (purpose === "compare") {
+        if (facts.body_crop_type === "close_crop" || facts.body_crop_type === "unclear") {
+            score -= 0.7;
+        }
+    }
+    return clampSubscoreToUserRange(score);
+}
+function deriveSubscoresFromFacts(facts, purpose) {
+    const composition = deriveCompositionScore(facts);
+    const lighting = deriveLightingScore(facts);
+    const presentation = derivePresentationScore(facts);
+    const purposeFit = derivePurposeFitScore(facts, purpose, composition, presentation);
+    return { composition, lighting, presentation, purposeFit };
 }
 const MAX_FEEDBACK_ITEM_LENGTH = 160;
 const MIN_FEEDBACK_ITEM_LENGTH = 12;
@@ -118,32 +617,145 @@ const MIN_FEEDBACK_ITEM_LENGTH = 12;
 const GENERIC_PHRASES = new Set([
     "good", "nice", "great", "good job", "well done", "could be better",
     "needs improvement", "try harder", "not bad", "decent", "ok", "okay",
-    "good photo", "nice photo", "great photo", "good outfit", "nice outfit",
-    "good style", "nice style", "great style", "looks good", "looks great",
+    "good photo", "nice photo", "great photo",
+    // Intentionally allow mild outfit/style praise like "looks good" so real feedback survives.
+    "add accessories", "add an accessory", "try adding an accessory", "add a statement piece",
+    "add bracelet", "add a bracelet", "add bracelets", "add some bracelets",
+    "add jewelry", "add some jewelry", "try adding jewelry",
 ]);
-function normalizeForDedupe(s) {
-    return s.toLowerCase().replace(/\s+/g, " ").trim();
-}
-function isGeneric(text) {
+/** Substrings that indicate feedback is about background/framing/lighting/photo rather than the outfit. */
+const BACKGROUND_FOCUSED_PATTERNS = [
+    "cleaner background", "simpler background", "less cluttered background", "clearer background",
+    "better background", "neutral background", "plain background", "uncluttered background",
+    "better framing", "improve framing", "tighter framing", "framing could", "crop the",
+    "improve lighting", "better lighting", "lighting could", "softer lighting", "natural lighting",
+    "photo could", "picture could", "shot could", "camera angle", "try a different angle",
+    "step back", "zoom out", "full body shot", "better photo", "retake", "take another",
+    "background is", "background distracts", "busy background", "cluttered background",
+    "framing is", "lighting is", "too dark", "too bright", "backlit", "shadow",
+];
+/** True when the feedback text is primarily about background, framing, lighting, or photo setup (not the outfit). */
+function isBackgroundFocusedFeedback(text) {
     const n = normalizeForDedupe(text);
-    if (n.length < MIN_FEEDBACK_ITEM_LENGTH)
+    for (const pattern of BACKGROUND_FOCUSED_PATTERNS) {
+        if (n.includes(pattern))
+            return true;
+    }
+    const words = n.split(/\s+/);
+    const backgroundWords = ["background", "framing", "lighting", "photo", "camera", "shot", "angle", "clutter", "cluttered"];
+    const count = words.filter((w) => backgroundWords.some((b) => w.includes(b))).length;
+    if (count >= 2)
         return true;
-    if (GENERIC_PHRASES.has(n))
-        return true;
-    if (GENERIC_PHRASES.has(n.replace(/\.$/, "")))
+    if (words.length <= 6 && count >= 1 && !n.includes("outfit") && !n.includes("fit") && !n.includes("color") && !n.includes("silhouette"))
         return true;
     return false;
 }
-/** Remove items that duplicate or closely repeat something in another list (e.g. suggestion repeating an improvement). */
+/** True when visible_facts indicate the outfit is hard to evaluate (poor visibility). */
+function isOutfitVisibilityPoor(facts) {
+    const v = (facts.outfit_visibility_quality ?? "").toLowerCase();
+    return (v.includes("hard") ||
+        v.includes("poor") ||
+        v.includes("unclear") ||
+        v.includes("limited") ||
+        v.includes("barely") ||
+        v.includes("cannot see") ||
+        v.includes("parse_failed"));
+}
+/** Remove background/framing/lighting-focused items when the outfit is clearly visible. */
+function dropBackgroundFocusedWhenVisible(items, facts) {
+    if (isOutfitVisibilityPoor(facts))
+        return items;
+    return items.filter((s) => {
+        const drop = isBackgroundFocusedFeedback(s);
+        if (drop && ANALYSIS_DEBUG_ENABLED) {
+            console.log(`${LOG_PREFIX} dropped background-focused feedback (outfit clearly visible)`, { text: s });
+        }
+        return !drop;
+    });
+}
+function normalizeForDedupe(s) {
+    return s.toLowerCase().replace(/\s+/g, " ").trim();
+}
+function isGeneric(text, debugContext) {
+    const n = normalizeForDedupe(text);
+    let reason = null;
+    if (n.length < MIN_FEEDBACK_ITEM_LENGTH) {
+        reason = "too_short";
+    }
+    else if (GENERIC_PHRASES.has(n)) {
+        reason = "generic_phrase_exact";
+    }
+    else if (GENERIC_PHRASES.has(n.replace(/\.$/, ""))) {
+        reason = "generic_phrase_trimmed_period";
+    }
+    if (reason && ANALYSIS_DEBUG_ENABLED && debugContext) {
+        console.log(`${LOG_PREFIX} filtered generic ${debugContext.section} item`, {
+            runId: debugContext.runId,
+            reason,
+            text,
+        });
+    }
+    return reason !== null;
+}
+/** Words that indicate a suggestion is an actionable next step rather than a restatement of the critique. */
+const ACTIONABLE_INDICATORS = new Set([
+    "plain", "wall", "window", "fill", "crop", "framing", "posture", "location",
+    "angle", "setting", "simpler", "different", "widen", "shoot", "try", "add",
+    "experiment", "move", "shift", "softer", "brighter", "earlier", "later",
+]);
+function contentWords(s) {
+    return normalizeForDedupe(s)
+        .replace(/[^\w\s]/g, " ")
+        .split(/\s+/)
+        .filter((w) => w.length > 2);
+}
+/** True if the suggestion is just restating an improvement (same concept, no concrete actionable step). */
+function isSuggestionRedundant(suggestion, improvements) {
+    const sNorm = normalizeForDedupe(suggestion);
+    const sWords = contentWords(suggestion);
+    const hasActionable = sWords.some((w) => ACTIONABLE_INDICATORS.has(w));
+    if (hasActionable && sWords.length >= 6)
+        return false;
+    for (const imp of improvements) {
+        const iNorm = normalizeForDedupe(imp);
+        if (sNorm === iNorm || sNorm.includes(iNorm) || iNorm.includes(sNorm))
+            return true;
+        const iWords = contentWords(imp);
+        const overlap = sWords.filter((w) => iWords.includes(w)).length;
+        if (overlap >= 2 && sWords.length <= 10 && !hasActionable)
+            return true;
+    }
+    return false;
+}
+/** Remove exact/substring duplicates and suggestions that only restate an improvement. */
 function dropCrossSectionDuplicates(suggestions, improvements) {
     const improvementKeys = new Set(improvements.map(normalizeForDedupe));
     return suggestions.filter((s) => {
         const key = normalizeForDedupe(s);
-        if (improvementKeys.has(key))
+        if (improvementKeys.has(key)) {
+            if (ANALYSIS_DEBUG_ENABLED) {
+                console.log(`${LOG_PREFIX} suggestion dropped as exact improvement duplicate`, {
+                    text: s,
+                });
+            }
             return false;
+        }
         for (const ik of improvementKeys) {
-            if (key.includes(ik) || ik.includes(key))
+            if (key.includes(ik) || ik.includes(key)) {
+                if (ANALYSIS_DEBUG_ENABLED) {
+                    console.log(`${LOG_PREFIX} suggestion dropped as substring improvement duplicate`, {
+                        text: s,
+                        improvementKey: ik,
+                    });
+                }
                 return false;
+            }
+        }
+        if (isSuggestionRedundant(s, improvements)) {
+            if (ANALYSIS_DEBUG_ENABLED) {
+                console.log(`${LOG_PREFIX} suggestion dropped as redundant with improvement`, { text: s });
+            }
+            return false;
         }
         return true;
     });
@@ -152,183 +764,521 @@ function sanitizeFeedbackItems(items) {
     const seen = new Set();
     return items
         .map((s) => String(s).trim().slice(0, MAX_FEEDBACK_ITEM_LENGTH))
-        .filter((s) => s.length > 0)
+        .filter((s) => {
+        if (s.length === 0) {
+            if (ANALYSIS_DEBUG_ENABLED) {
+                console.log(`${LOG_PREFIX} sanitized out empty/whitespace item`);
+            }
+            return false;
+        }
+        return true;
+    })
         .filter((s) => {
         const key = normalizeForDedupe(s);
-        if (seen.has(key))
+        if (seen.has(key)) {
+            if (ANALYSIS_DEBUG_ENABLED) {
+                console.log(`${LOG_PREFIX} sanitized out duplicate item`, { text: s });
+            }
             return false;
+        }
         seen.add(key);
         return true;
     });
 }
-function parseFullResponse(parsed) {
-    if (!parsed || typeof parsed !== "object")
-        return null;
-    const p = parsed;
-    const isValid = p.isValid === true;
-    const validationMessage = p.validationMessage != null && typeof p.validationMessage === "string"
-        ? String(p.validationMessage).trim()
-        : null;
-    const reason = (0, types_1.isValidationReason)(p.reason) ? p.reason : null;
-    if (!isValid) {
-        const message = validationMessage && validationMessage.length > 0
-            ? validationMessage
-            : "This photo doesn't appear suitable for analysis.";
-        const validReason = reason ?? "image_not_relevant";
+/** Build the standard invalid AnalysisResponse (e.g. when person not visible). */
+function buildInvalidValidationResponse(reason) {
+    return {
+        isValid: false,
+        validationMessage: "This photo doesn't appear suitable for analysis.",
+        reason,
+        score: null,
+        subscores: null,
+        strengths: [],
+        improvements: [],
+        suggestions: [],
+        analysisTips: [],
+        improvementSuggestions: [],
+    };
+}
+// --- Contradiction / sanity cleanup ---
+function sanitizeContradictorySuggestions(facts, analysis) {
+    const shouldDropTuckAdvice = facts.top_tucked === true;
+    const braceletsPresent = facts.bracelets_visible === true || facts.watch_visible === true;
+    const shoesHidden = facts.shoe_visible === false;
+    const pantHemHidden = facts.pant_hem_visible === false;
+    const earsHidden = facts.ear_visibility === "hidden" || facts.ear_visibility === "unclear";
+    const topClearlyFitted = facts.top_fit === "fitted";
+    const beltPresent = facts.belt_visible === true;
+    const beltVisibilityUnclear = facts.belt_visible == null;
+    const braceletOrWatchUnclear = facts.bracelets_visible == null && facts.watch_visible == null;
+    const necklacePresent = facts.necklace_visible === true;
+    const necklaceUnclear = facts.necklace_visible == null;
+    const ringsPresent = facts.ring_visible === true;
+    const ringsUnclear = facts.ring_visible == null;
+    const accessorySummary = (facts.accessory_summary ?? "").toLowerCase().trim();
+    const anyAccessoriesPresent = beltPresent ||
+        braceletsPresent ||
+        necklacePresent ||
+        ringsPresent ||
+        accessorySummary.length > 0;
+    const originalImprovements = analysis.improvements;
+    const originalSuggestions = analysis.suggestions;
+    function keepItem(text) {
+        const t = normalizeForDedupe(text);
+        if (shouldDropTuckAdvice && /\btuck(ed|ing)?\b/.test(t)) {
+            if (ANALYSIS_DEBUG_ENABLED) {
+                console.log(`${LOG_PREFIX} dropping tuck-related advice due to top_tucked=true`, {
+                    text,
+                });
+            }
+            return false;
+        }
+        // Accessory conservatism: avoid speculative advice when visibility is unclear.
+        if (beltVisibilityUnclear && t.includes("belt")) {
+            if (ANALYSIS_DEBUG_ENABLED) {
+                console.log(`${LOG_PREFIX} dropping belt-related advice due to unclear belt visibility`, { text });
+            }
+            return false;
+        }
+        if (braceletOrWatchUnclear && (t.includes("bracelet") || t.includes("bracelets") || t.includes("watch") || t.includes("wrist"))) {
+            if (ANALYSIS_DEBUG_ENABLED) {
+                console.log(`${LOG_PREFIX} dropping bracelet/watch advice due to unclear wrist visibility`, { text });
+            }
+            return false;
+        }
+        if (necklaceUnclear && t.includes("necklace")) {
+            if (ANALYSIS_DEBUG_ENABLED) {
+                console.log(`${LOG_PREFIX} dropping necklace advice due to unclear neck visibility`, { text });
+            }
+            return false;
+        }
+        if (ringsUnclear && (t.includes("ring") || t.includes("rings"))) {
+            if (ANALYSIS_DEBUG_ENABLED) {
+                console.log(`${LOG_PREFIX} dropping ring advice due to unclear hand visibility`, { text });
+            }
+            return false;
+        }
+        // Hard "already present" constraints for accessories.
+        if (beltPresent) {
+            const beltPhrases = [
+                "add a belt",
+                "add belt",
+                "try a belt",
+                "try adding a belt",
+                "consider a belt",
+                "belt could help",
+                "belt would help",
+                "introduce a belt",
+                "include a belt",
+                "wear a belt",
+            ];
+            if (beltPhrases.some((p) => t.includes(p))) {
+                if (ANALYSIS_DEBUG_ENABLED) {
+                    console.log(`${LOG_PREFIX} dropping belt-add advice due to belt_visible=true`, { text });
+                }
+                return false;
+            }
+        }
+        if (braceletsPresent) {
+            const braceletPhrases = [
+                "add a bracelet",
+                "add bracelet",
+                "add bracelets",
+                "try a bracelet",
+                "add a watch",
+                "add watch",
+                "add a wrist accessory",
+                "add wrist accessories",
+            ];
+            if (braceletPhrases.some((p) => t.includes(p))) {
+                if (ANALYSIS_DEBUG_ENABLED) {
+                    console.log(`${LOG_PREFIX} dropping bracelet/watch-add advice due to bracelets/watch already visible`, {
+                        text,
+                    });
+                }
+                return false;
+            }
+        }
+        if (necklacePresent) {
+            const necklacePhrases = [
+                "add a necklace",
+                "add necklace",
+                "try a necklace",
+                "layer a necklace",
+            ];
+            if (necklacePhrases.some((p) => t.includes(p))) {
+                if (ANALYSIS_DEBUG_ENABLED) {
+                    console.log(`${LOG_PREFIX} dropping necklace-add advice due to necklace_visible=true`, { text });
+                }
+                return false;
+            }
+        }
+        if (ringsPresent) {
+            const ringPhrases = [
+                "add rings",
+                "add a ring",
+                "add some rings",
+            ];
+            if (ringPhrases.some((p) => t.includes(p))) {
+                if (ANALYSIS_DEBUG_ENABLED) {
+                    console.log(`${LOG_PREFIX} dropping ring-add advice due to ring_visible=true`, { text });
+                }
+                return false;
+            }
+        }
+        if (anyAccessoriesPresent) {
+            const genericAccessoryPhrases = [
+                "add accessories",
+                "add some accessories",
+                "add an accessory",
+                "more accessories",
+                "extra accessories",
+            ];
+            if (genericAccessoryPhrases.some((p) => t.includes(p))) {
+                if (ANALYSIS_DEBUG_ENABLED) {
+                    console.log(`${LOG_PREFIX} dropping generic accessory-add advice due to accessories already present`, {
+                        text,
+                    });
+                }
+                return false;
+            }
+        }
+        if (shoesHidden && (t.includes("shoe") || t.includes("sneaker") || t.includes("boot") || t.includes("footwear"))) {
+            return false;
+        }
+        if (pantHemHidden && (t.includes("hem") || t.includes("pant length") || t.includes("shorten the pants") || t.includes("crop the pants"))) {
+            return false;
+        }
+        if (earsHidden && (t.includes("earring") || t.includes("earrings"))) {
+            return false;
+        }
+        if (topClearlyFitted && (t.includes("more fitted") || t.includes("tighter") || t.includes("tighten the waist") || t.includes("closer to the body") || t.includes("more form fitting"))) {
+            return false;
+        }
+        return true;
+    }
+    const cleanedImprovements = analysis.improvements.filter(keepItem);
+    const cleanedSuggestions = analysis.suggestions.filter(keepItem);
+    const cleanedImprovementSuggestions = analysis.improvementSuggestions?.filter(keepItem) ?? analysis.improvementSuggestions;
+    if (ANALYSIS_DEBUG_ENABLED) {
+        console.log(`${LOG_PREFIX} contradictions cleanup — already_present`, {
+            top_tucked: facts.top_tucked,
+            belt_visible: facts.belt_visible,
+            bracelets_visible: facts.bracelets_visible,
+            watch_visible: facts.watch_visible,
+            necklace_visible: facts.necklace_visible,
+            ring_visible: facts.ring_visible,
+            shoe_visible: facts.shoe_visible,
+            ear_visibility: facts.ear_visibility,
+            originalSuggestions,
+            cleanedSuggestions,
+            originalImprovements,
+            cleanedImprovements,
+        });
+    }
+    return {
+        ...analysis,
+        improvements: cleanedImprovements,
+        suggestions: cleanedSuggestions,
+        improvementSuggestions: cleanedImprovementSuggestions && cleanedImprovementSuggestions.length > 0
+            ? cleanedImprovementSuggestions
+            : analysis.improvementSuggestions,
+    };
+}
+/**
+ * Ensures the response always has the full shape expected by iOS: arrays are never undefined,
+ * score/subscores present when valid. Prevents decode/render crashes from malformed success responses.
+ */
+function ensureCompleteResponse(r) {
+    const strengths = Array.isArray(r.strengths) ? r.strengths : [];
+    const improvements = Array.isArray(r.improvements) ? r.improvements : [];
+    const suggestions = Array.isArray(r.suggestions) ? r.suggestions : [];
+    const analysisTips = Array.isArray(r.analysisTips) ? r.analysisTips : [];
+    const improvementSuggestions = Array.isArray(r.improvementSuggestions) ? r.improvementSuggestions : undefined;
+    if (!r.isValid) {
         return {
             isValid: false,
-            validationMessage: message,
-            reason: validReason,
+            validationMessage: r.validationMessage != null ? String(r.validationMessage) : "This photo doesn't appear suitable for analysis.",
+            reason: r.reason ?? "image_not_relevant",
             score: null,
             subscores: null,
             strengths: [],
             improvements: [],
             suggestions: [],
+            analysisTips: [],
+            improvementSuggestions: [],
         };
     }
-    const scoreRaw = p.score;
-    const rawScore = scoreRaw != null && typeof scoreRaw === "number"
-        ? scoreRaw
-        : Number(scoreRaw);
-    const fallbackScore = Number.isNaN(rawScore) ? 7 : roundToOneDecimal(rawScore);
-    const subscores = parseSubscores(p, fallbackScore);
-    const score = subscores != null
-        ? overallFromSubscores(subscores)
-        : fallbackScore;
-    const rawStrengths = Array.isArray(p.strengths) ? p.strengths.map(String) : [];
-    const rawImprovements = Array.isArray(p.improvements) ? p.improvements.map(String) : [];
-    const rawSuggestions = Array.isArray(p.suggestions) ? p.suggestions.map(String) : [];
-    let strengths = sanitizeFeedbackItems(rawStrengths).filter((s) => !isGeneric(s));
-    let improvements = sanitizeFeedbackItems(rawImprovements).filter((s) => !isGeneric(s));
-    let suggestions = sanitizeFeedbackItems(rawSuggestions).filter((s) => !isGeneric(s));
-    suggestions = dropCrossSectionDuplicates(suggestions, improvements);
-    const fallbackStrengths = ["Clear subject and framing", "Outfit is visible and evaluable"];
-    const fallbackImprovements = ["Refine framing or lighting for a stronger shot"];
-    const fallbackSuggestions = ["Try another angle or setting for comparison"];
+    const subscores = r.subscores && typeof r.subscores === "object" && !Array.isArray(r.subscores)
+        ? r.subscores
+        : subscoresFromScore(6.5);
+    const score = typeof r.score === "number" && !Number.isNaN(r.score) ? roundToOneDecimal(r.score) : overallFromSubscores(subscores);
     return {
-        isValid: true,
-        validationMessage: null,
-        reason: null,
+        ...r,
+        strengths,
+        improvements,
+        suggestions,
+        analysisTips,
+        improvementSuggestions: improvementSuggestions && improvementSuggestions.length > 0 ? improvementSuggestions : undefined,
         score,
         subscores,
-        strengths: strengths.length > 0 ? strengths : fallbackStrengths,
-        improvements: improvements.length > 0 ? improvements : fallbackImprovements,
-        suggestions: suggestions.length > 0 ? suggestions : fallbackSuggestions,
+        scoreExplanation: r.scoreExplanation ?? deriveScoreExplanation(subscores),
     };
 }
-/** Parse phase-1 validation-only response into an invalid AnalysisResponse when isValid is false. */
-function parseValidationResponse(raw) {
-    let parsed;
-    try {
-        parsed = JSON.parse(raw);
-    }
-    catch {
-        return { valid: true };
-    }
-    if (parsed.isValid === true)
-        return { valid: true };
-    const validationMessage = parsed.validationMessage != null && typeof parsed.validationMessage === "string"
-        ? String(parsed.validationMessage).trim()
-        : "This photo doesn't appear suitable for analysis.";
-    const reason = (0, types_1.isValidationReason)(parsed.reason) ? parsed.reason : "image_not_relevant";
-    return {
-        valid: false,
-        response: {
-            isValid: false,
-            validationMessage: validationMessage || "This photo doesn't appear suitable for analysis.",
-            reason,
-            score: null,
-            subscores: null,
-            strengths: [],
-            improvements: [],
-            suggestions: [],
-        },
-    };
-}
-async function analyzePhotoWithAI(imageBase64, purpose) {
+async function analyzePhotoWithAI(imageBase64, purpose, runId) {
     const apiKey = process.env.OPENAI_API_KEY?.trim();
     if (!apiKey) {
         console.log(`${LOG_PREFIX} Falling back to mock analysis: missing API key`);
-        return getFallbackMockResult();
+        if (ANALYSIS_DEBUG_ENABLED) {
+            console.log(`${LOG_PREFIX} debug: getFallbackMockResult() used due to missing API key`);
+        }
+        return ensureCompleteResponse(getFallbackMockResult());
     }
+    const t0 = Date.now();
+    console.log(`${LOG_PREFIX} request pipeline started`, { purpose, runId });
     try {
         const openai = new openai_1.default({ apiKey });
         const model = getModel();
+        const tResize0 = Date.now();
         const compressedBase64 = await (0, imageUtils_1.resizeAndCompressImage)(imageBase64);
+        const imagePreprocessMs = Date.now() - tResize0;
+        console.log(`${LOG_PREFIX} phase image_preprocess_ms`, { imagePreprocessMs });
         const imageUrl = compressedBase64.startsWith("data:")
             ? compressedBase64
             : `data:image/jpeg;base64,${compressedBase64}`;
-        console.log(`${LOG_PREFIX} OpenAI validation request started`);
-        const validationCompletion = await openai.chat.completions.create({
-            model,
-            messages: [
-                { role: "system", content: VALIDATION_SYSTEM },
-                {
-                    role: "user",
-                    content: [
-                        { type: "image_url", image_url: { url: imageUrl, detail: "low" } },
-                        { type: "text", text: VALIDATION_USER },
-                    ],
-                },
-            ],
-            response_format: { type: "json_object" },
-            max_tokens: 80,
-        });
-        console.log(`${LOG_PREFIX} OpenAI validation response received`);
-        const validationRaw = validationCompletion.choices[0]?.message?.content;
-        if (typeof validationRaw === "string") {
-            const validation = parseValidationResponse(validationRaw);
-            if (!validation.valid) {
-                console.log(`${LOG_PREFIX} guardrail check: failed`, { reason: validation.response.reason, purpose });
-                return validation.response;
+        const fingerprint = computeImageFingerprint(compressedBase64);
+        const debugInfo = ANALYSIS_DEBUG_ENABLED
+            ? {
+                purpose,
+                fingerprint,
+                cacheHitType: "none",
             }
+            : null;
+        // Fast path: exact same normalized image seen before.
+        const exactCached = ANALYSIS_CACHE.get(fingerprint);
+        if (exactCached && exactCached.purpose === purpose) {
+            exactCached.lastUsedAt = Date.now();
+            const totalRequestMs = Date.now() - t0;
+            console.log(`${LOG_PREFIX} cache hit: exact image fingerprint`, { purpose });
+            console.log(`${LOG_PREFIX} phase total_request_ms`, { totalRequestMs });
+            if (debugInfo) {
+                debugInfo.cacheHitType = "exact";
+                debugInfo.finalStrengths = exactCached.response.strengths;
+                debugInfo.finalImprovements = exactCached.response.improvements;
+                debugInfo.finalSuggestions = exactCached.response.suggestions;
+                debugInfo.finalAnalysisTips = exactCached.response.analysisTips;
+                debugInfo.finalScore = exactCached.response.score;
+                logDebugSnapshot("exact_cache_return", debugInfo);
+            }
+            console.log(`${LOG_PREFIX} summary`, {
+                total_request_ms: totalRequestMs,
+                cache: "exact",
+                visible_facts_fallback: false,
+                path: "fast",
+            });
+            return ensureCompleteResponse(exactCached.response);
         }
-        console.log(`${LOG_PREFIX} guardrail check: passed`);
-        console.log(`${LOG_PREFIX} OpenAI analysis request started`);
-        const systemPrompt = getFullAnalysisSystemPrompt(purpose);
-        const userText = "Score and give feedback grounded in visible details from the image. Use one decimal per score (e.g. 8.1, 8.4, 8.8). No generic praise, no repeated points across sections. Output only valid JSON.";
-        const completion = await openai.chat.completions.create({
+        // Single OpenAI round-trip: visible_facts + strengths/improvements/suggestions in one response.
+        const fullAnalysisDetail = "low";
+        const singleRequestMaxTokens = 350;
+        const tOpenAI0 = Date.now();
+        console.log(`${LOG_PREFIX} OpenAI single combined request started`, {
+            model,
+            purpose,
+            detail: fullAnalysisDetail,
+            max_tokens: singleRequestMaxTokens,
+        });
+        const completion = await withTimeout(openai.chat.completions.create({
             model,
             messages: [
-                { role: "system", content: systemPrompt },
+                { role: "system", content: COMBINED_SINGLE_REQUEST_SYSTEM },
                 {
                     role: "user",
                     content: [
-                        { type: "image_url", image_url: { url: imageUrl, detail: "high" } },
-                        { type: "text", text: userText },
+                        { type: "image_url", image_url: { url: imageUrl, detail: fullAnalysisDetail } },
+                        { type: "text", text: getCombinedUserPrompt(purpose) },
                     ],
                 },
             ],
             response_format: { type: "json_object" },
-            max_tokens: 700,
-        });
-        console.log(`${LOG_PREFIX} OpenAI analysis response received`);
+            max_tokens: singleRequestMaxTokens,
+        }), OPENAI_REQUEST_TIMEOUT_MS, "Single combined analysis");
+        const openaiRequestMs = Date.now() - tOpenAI0;
+        console.log(`${LOG_PREFIX} phase openai_request_ms`, { openaiRequestMs });
         const raw = completion.choices[0]?.message?.content;
         if (!raw || typeof raw !== "string") {
-            console.log(`${LOG_PREFIX} structured parsing failed: empty or non-string content`);
+            console.log(`${LOG_PREFIX} single response missing or non-string`);
             throw new errors_1.InvalidAIResponseError("Empty or non-string AI response");
         }
-        console.log(`${LOG_PREFIX} structured parsing started`);
-        let parsed;
-        try {
-            parsed = JSON.parse(raw);
+        const tParse0 = Date.now();
+        const parsedCombined = parseSingleCombinedResponse(raw, runId);
+        const parseMs = Date.now() - tParse0;
+        console.log(`${LOG_PREFIX} phase parse_ms`, { parseMs });
+        let visibleFacts;
+        let visibleFactsFromFallback;
+        let strengths;
+        let improvements;
+        let suggestions;
+        let analysisTips;
+        let improvementSuggestions;
+        if (parsedCombined) {
+            visibleFacts = parsedCombined.visibleFacts;
+            visibleFactsFromFallback = parsedCombined.visibleFactsFromFallback;
+            strengths = parsedCombined.strengths;
+            improvements = parsedCombined.improvements;
+            suggestions = parsedCombined.suggestions;
+            analysisTips = parsedCombined.analysisTips;
+            improvementSuggestions = parsedCombined.improvementSuggestions;
         }
-        catch (parseErr) {
-            console.log(`${LOG_PREFIX} structured parsing failed: JSON parse error`);
-            throw new errors_1.InvalidAIResponseError("Invalid JSON in AI response");
+        else {
+            visibleFacts = { ...DEFAULT_VISIBLE_FACTS, outfit_visibility_quality: "parse_failed" };
+            visibleFactsFromFallback = true;
+            strengths = [];
+            improvements = [];
+            suggestions = [];
+            analysisTips = [];
+            improvementSuggestions = [];
         }
-        const result = parseFullResponse(parsed);
-        if (result === null) {
-            console.log(`${LOG_PREFIX} structured parsing failed: invalid response shape`);
-            throw new errors_1.InvalidAIResponseError("Invalid analysis response shape");
+        if (!visibleFacts.person_visible) {
+            const totalRequestMs = Date.now() - t0;
+            console.log(`${LOG_PREFIX} guardrail check: no person visible`, { purpose });
+            console.log(`${LOG_PREFIX} phase total_request_ms`, { totalRequestMs });
+            console.log(`${LOG_PREFIX} summary`, {
+                total_request_ms: totalRequestMs,
+                cache: "none",
+                visible_facts_fallback: visibleFactsFromFallback,
+                path: "invalid_no_person",
+            });
+            if (debugInfo) {
+                debugInfo.phase1Rejected = true;
+                debugInfo.phase1Reason = "no_person_detected";
+                logDebugSnapshot("person_not_visible_rejected", debugInfo);
+            }
+            return buildInvalidValidationResponse("no_person_detected");
         }
-        console.log(`${LOG_PREFIX} structured parsing succeeded`);
-        if (!result.isValid) {
-            console.log(`${LOG_PREFIX} guardrail check (phase 2): rejected`, { reason: result.reason, purpose });
-            return result;
+        const derivedSubscores = visibleFactsFromFallback
+            ? subscoresFromScore(6.5)
+            : deriveSubscoresFromFacts(visibleFacts, purpose);
+        const derivedScore = overallFromSubscores(derivedSubscores);
+        console.log(`${LOG_PREFIX} derived scores from visible facts`, {
+            purpose,
+            subscores: derivedSubscores,
+            score: derivedScore,
+        });
+        if (debugInfo) {
+            debugInfo.visibleFactsSummary = {
+                body_crop_type: visibleFacts.body_crop_type,
+                outfit_visibility_quality: visibleFacts.outfit_visibility_quality,
+                background_simple_or_busy: visibleFacts.background_simple_or_busy,
+                color_palette_summary: visibleFacts.color_palette_summary,
+                silhouette_read: visibleFacts.silhouette_read,
+                shoe_visible: visibleFacts.shoe_visible,
+                pant_hem_visible: visibleFacts.pant_hem_visible,
+                belt_visible: visibleFacts.belt_visible,
+                bracelets_visible: visibleFacts.bracelets_visible,
+                watch_visible: visibleFacts.watch_visible,
+                necklace_visible: visibleFacts.necklace_visible,
+                ring_visible: visibleFacts.ring_visible,
+                top_tucked: visibleFacts.top_tucked,
+                ear_visibility: visibleFacts.ear_visibility,
+            };
+            debugInfo.evaluability = classifyEvaluability(visibleFacts);
+            debugInfo.derivedSubscores = derivedSubscores;
+            debugInfo.derivedScore = derivedScore;
+            debugInfo.visibleFactsFromFallback = visibleFactsFromFallback;
         }
-        console.log(`${LOG_PREFIX} analysis complete`, { purpose, score: result.score });
-        return result;
+        const allowNearDuplicateAnchor = !visibleFactsFromFallback &&
+            (visibleFacts.outfit_visibility_quality ?? "").toLowerCase() !== "parse_failed";
+        if (allowNearDuplicateAnchor) {
+            const bestMatch = findBestCachedMatch(purpose, visibleFacts);
+            if (bestMatch && bestMatch.similarity >= 0.95) {
+                bestMatch.entry.lastUsedAt = Date.now();
+                const totalRequestMs = Date.now() - t0;
+                console.log(`${LOG_PREFIX} near-duplicate cache hit, returning cached`, { purpose, similarity: bestMatch.similarity });
+                console.log(`${LOG_PREFIX} phase total_request_ms`, { totalRequestMs });
+                console.log(`${LOG_PREFIX} summary`, {
+                    total_request_ms: totalRequestMs,
+                    cache: "near_duplicate",
+                    visible_facts_fallback: visibleFactsFromFallback,
+                    path: "fast",
+                });
+                if (debugInfo) {
+                    debugInfo.cacheHitType = "near_duplicate";
+                    debugInfo.cacheAnchorSimilarity = bestMatch.similarity;
+                }
+                return ensureCompleteResponse(bestMatch.entry.response);
+            }
+        }
+        const strengthsSanitized = sanitizeFeedbackItems(strengths);
+        const improvementsSanitized = sanitizeFeedbackItems(improvements);
+        const suggestionsSanitized = sanitizeFeedbackItems(suggestions);
+        let strengthsFiltered = strengthsSanitized.filter((s) => !isGeneric(s, { section: "strengths", runId: debugInfo?.fingerprint }));
+        let improvementsFiltered = improvementsSanitized.filter((s) => !isGeneric(s, { section: "improvements", runId: debugInfo?.fingerprint }));
+        let suggestionsFiltered = suggestionsSanitized.filter((s) => !isGeneric(s, { section: "suggestions", runId: debugInfo?.fingerprint }));
+        suggestionsFiltered = dropCrossSectionDuplicates(suggestionsFiltered, improvementsFiltered);
+        const analysisTipsSanitized = sanitizeFeedbackItems(analysisTips);
+        let improvementSuggestionsSanitized = sanitizeFeedbackItems(improvementSuggestions).slice(0, 5);
+        // When outfit is clearly visible, strip background/framing/lighting-focused feedback from all sections.
+        strengthsFiltered = dropBackgroundFocusedWhenVisible(strengthsFiltered, visibleFacts);
+        improvementsFiltered = dropBackgroundFocusedWhenVisible(improvementsFiltered, visibleFacts);
+        suggestionsFiltered = dropBackgroundFocusedWhenVisible(suggestionsFiltered, visibleFacts);
+        improvementSuggestionsSanitized = dropBackgroundFocusedWhenVisible(improvementSuggestionsSanitized, visibleFacts);
+        const analysisTipsFinal = isOutfitVisibilityPoor(visibleFacts) ? analysisTipsSanitized : [];
+        const factDrivenResult = {
+            isValid: true,
+            validationMessage: null,
+            reason: null,
+            score: derivedScore,
+            subscores: derivedSubscores,
+            scoreExplanation: deriveScoreExplanation(derivedSubscores),
+            strengths: strengthsFiltered,
+            improvements: improvementsFiltered.length > 0 ? improvementsFiltered : [],
+            suggestions: suggestionsFiltered,
+            analysisTips: analysisTipsFinal,
+            improvementSuggestions: improvementSuggestionsSanitized.length > 0 ? improvementSuggestionsSanitized : undefined,
+        };
+        const sanitized = sanitizeContradictorySuggestions(visibleFacts, factDrivenResult);
+        const completeSanitized = ensureCompleteResponse(sanitized);
+        putCachedAnalysis(fingerprint, purpose, visibleFacts, completeSanitized);
+        if (debugInfo) {
+            debugInfo.finalStrengths = completeSanitized.strengths;
+            debugInfo.finalImprovements = completeSanitized.improvements;
+            debugInfo.finalSuggestions = completeSanitized.suggestions;
+            debugInfo.finalAnalysisTips = completeSanitized.analysisTips;
+            debugInfo.finalScore = completeSanitized.score;
+            logDebugSnapshot("final_sanitized_output", debugInfo);
+        }
+        let finalResponse = completeSanitized;
+        if (ANALYSIS_DEBUG_ENABLED && debugInfo) {
+            finalResponse = {
+                ...completeSanitized,
+                debug: {
+                    visibleFactsSummary: debugInfo.visibleFactsSummary ?? null,
+                    evaluability: debugInfo.evaluability ?? null,
+                    visibleFactsFromFallback: debugInfo.visibleFactsFromFallback ?? false,
+                    strengthsCount: completeSanitized.strengths.length,
+                    improvementsCount: completeSanitized.improvements.length,
+                    suggestionsCount: completeSanitized.suggestions.length,
+                },
+            };
+        }
+        const totalRequestMs = Date.now() - t0;
+        console.log(`${LOG_PREFIX} final score summary`, {
+            purpose,
+            subscores: finalResponse.subscores,
+            score: finalResponse.score,
+            fromVisibleFactsFallback: debugInfo?.visibleFactsFromFallback ?? false,
+            cacheHitType: debugInfo?.cacheHitType ?? "none",
+        });
+        console.log(`${LOG_PREFIX} analysis complete`, { purpose, score: finalResponse.score });
+        console.log(`${LOG_PREFIX} phase total_request_ms`, { totalRequestMs });
+        console.log(`${LOG_PREFIX} summary`, {
+            total_request_ms: totalRequestMs,
+            cache: "none",
+            visible_facts_fallback: visibleFactsFromFallback,
+            path: "success",
+        });
+        return finalResponse;
     }
     catch (err) {
         if (err instanceof errors_1.InvalidAIResponseError) {

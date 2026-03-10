@@ -4,10 +4,8 @@ import { InvalidAIResponseError, OpenAIServiceError } from "../errors";
 import {
   AnalysisResponse,
   AnalysisSubscores,
-  AnalysisDebug,
   PhotoPurpose,
   ValidationReason,
-  isValidationReason,
 } from "../types";
 import { resizeAndCompressImage } from "./imageUtils";
 
@@ -20,6 +18,21 @@ const ANALYSIS_DEBUG_ENABLED =
 /** Temporary debug: force gpt-4o-mini for reliability testing. */
 function getModel(): string {
   return "gpt-4o-mini";
+}
+
+/** Abort OpenAI request after this many ms to avoid hanging; env override allowed. */
+const OPENAI_REQUEST_TIMEOUT_MS = Math.min(
+  60000,
+  Math.max(20000, parseInt(process.env.OPENAI_REQUEST_TIMEOUT_MS || "45000", 10) || 45000)
+);
+
+function withTimeout<T>(promise: Promise<T>, ms: number, phase: string): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => {
+      reject(new OpenAIServiceError(`${phase} timed out after ${ms}ms`, 504));
+    }, ms);
+    promise.then((r) => { clearTimeout(t); resolve(r); }).catch((e) => { clearTimeout(t); reject(e); });
+  });
 }
 
 /** Clamp to 0–10 and round to one decimal place. All scores use this for consistency. */
@@ -118,252 +131,7 @@ function logDebugSnapshot(stage: string, info: AnalysisDebugInfo | null | undefi
   }
 }
 
-// --- Cheap validation (phase 1): low-detail image, minimal prompt, ~80 tokens out ---
-const VALIDATION_SYSTEM =
-  `Reply with only a JSON object: { "isValid": boolean, "validationMessage": string | null, "reason": string | null }.
-Set isValid to false only if the image is clearly: no person (landscape, food, pet, object, screenshot, meme). Use reason: "no_person_detected" | "outfit_not_visible" | "image_not_relevant" | "framing_too_unclear". If a person is visible or unsure, set isValid true, validationMessage and reason null. No other text.`;
-
-const VALIDATION_USER = "Is there a clearly visible person in this image suitable for outfit/photo feedback? Reply with the JSON only.";
-
-// --- Full analysis (phase 2): outfit-first evaluation ---
-
-const REASONING_PROCESS = `
-Before scoring, follow this order. The score reflects OUTFIT quality; photo quality has minimal weight (5%).
-
-1) IDENTIFY VISIBLE CLOTHING
-   List visible pieces: tops, outerwear, bottoms, shoes, accessories. Reference these in feedback.
-
-2) EVALUATE FIT AND PROPORTION (40% + 20% of score)
-   Fit: how garments sit—shoulders, waist, length. Proportion/silhouette: balance between top and bottom, layering, overall shape. This is the primary driver of the score.
-
-3) EVALUATE COLOR COORDINATION (25%)
-   How colors work together across the outfit. Palette balance.
-
-4) EVALUATE STYLE COHESION AND OCCASION (10%)
-   How well the look holds together and fits the chosen purpose.
-
-5) PHOTO CLARITY (5% only)
-   Only whether the outfit is visible enough to evaluate. If the outfit is visible, score 7.0 or higher. Do NOT penalize for background, lighting, or framing. Do not let photo quality drag down the overall score for a good outfit.
-`;
-
-const EVIDENCE_BASED_FIT_RULES = `
-EVIDENCE-BASED FIT AND IMPROVEMENTS — CRITICAL:
-- Base ALL fit and "Could Improve" feedback ONLY on what is clearly visible in the image. Do not invent or assume.
-- Do NOT suggest a garment should be looser, tighter, or more tailored if that contradicts what is visible (e.g. do NOT say "the shirt could be looser" when the shirt is already visibly oversized).
-- For fit: either (a) describe what you actually see (e.g. "The shirt reads slightly oversized, which softens the silhouette"), or (b) if fit is hard to judge from angle/lighting, say so and avoid a strong directional recommendation (e.g. "Fit is harder to judge from this angle—no strong fit change needed").
-- "Could Improve" must reflect actual weaknesses visible in this photo, not default or generic style advice. If the image is strong, give fewer or no improvements; do not pad with filler.
-- Never give advice that contradicts the visible garment (e.g. "try a looser fit" when the item is already loose). Stay grounded in observable details only.
-`;
-
-const VISIBILITY_GROUNDING_RULES = `
-VISIBILITY — ONLY CRITIQUE WHAT IS CLEARLY VISIBLE. CRITICAL:
-- Do NOT comment on, suggest, or critique any clothing area or garment detail that is NOT clearly visible in the image. Do not infer or assume hidden details.
-- Do NOT recommend hemming pants, shortening pants, adjusting pant break, or any pant-length or leg-hem advice UNLESS the full leg and hem (or at least the ankle/break) are clearly visible in the photo. If pants are cropped out, say nothing about pant length or use: "Pant length is not clearly visible enough to judge."
-- Do NOT recommend or comment on footwear, shoe choice, or socks UNLESS feet/shoes are clearly visible in the image.
-- Do NOT recommend hemming sleeves, tailoring cuffs, or adjusting sleeve length UNLESS the sleeve ends or cuffs are clearly visible.
-- Do NOT suggest altering hems, cuffs, or garment edges that are cropped out or not visible. Prefer conservative feedback over speculative advice.
-- If an outfit area is cropped out, obscured, or unclear: either stay silent about that area, or use explicit hedging (e.g. "Sleeve length is not clearly visible enough to judge", "Footwear is not visible in this frame").
-- Only critique specific garment zones when they are visible enough in the image to support the comment. When in doubt, omit the point.
-`;
-
-const GROUNDED_STYLING_SUGGESTIONS_RULES = `
-PART 1 — IDENTIFY VISIBLE STYLING FACTS FIRST
-- Before generating strengths, improvements, suggestions, or improvementSuggestions, first identify key visible styling facts such as:
-  - whether the top is tucked or untucked
-  - whether bracelets, watches, necklaces, rings, belts, bags, or other accessories are visible
-  - whether shoes/footwear are visible
-  - whether earrings or the ear area are visible
-  - whether the waistband/waistline styling is visible
-  - whether garment edges like hems, cuffs, or sleeves are clearly visible
-- Treat these visible facts as hard constraints for later feedback and suggestions. Subsequent recommendations must not contradict what you have already observed.
-
-PART 2 — DO NOT RECOMMEND WHAT IS ALREADY PRESENT
-- Do NOT recommend a styling action if that detail is already clearly and visibly present in the image.
-- Examples: do not suggest tucking in a top that is already tucked; do not suggest bracelets or a watch if bracelets or a watch are already visible; do not suggest "add accessories" generically if accessories are already present unless the recommendation is specifically different and clearly justified by what you see.
-- When analysisContext.visibleFacts.top_tucked is true, do NOT suggest tucking, re-tucking, or "enhancing waist definition by tucking" the top. Treat an already tucked top as an existing styling choice, not an improvement opportunity.
-- If a detail is already present and working well, prefer to acknowledge it as a strength rather than recommending it again as an improvement.
-
-PART 3 — DO NOT RECOMMEND HIDDEN OR UNCLEAR DETAILS
-- Do NOT recommend changes to areas that are hidden, cropped out, or not clearly visible.
-- Examples:
-  - do not suggest earrings unless the ear area is clearly visible and the recommendation is visually justified
-  - do not suggest shoe changes unless footwear is clearly visible
-  - do not suggest hemming or pant-break changes unless the lower pant edge or hem is visible
-  - do not suggest belt or waistband changes unless the waist area is clearly visible
-  - do not suggest sleeve/cuff changes unless sleeves/cuffs are clearly visible
-- If visibility is limited for a specific area, either stay silent about that area OR use conservative wording such as "That area is not clearly visible enough to judge."
-
-PART 4 — DO NOT FORCE WEAK SUGGESTIONS
-- If the outfit already appears clean, coherent, and visually complete, it is acceptable to return fewer suggestions.
-- Do NOT force weak or generic filler advice just to populate every section.
-- It is acceptable to return 1 strong suggestion instead of 3 weak ones.
-- It is acceptable to return no improvementSuggestions when there is no honest, evidence-based recommendation grounded in the image.
-- Quality rule: prefer fewer, better suggestions over more generic ones.
-
-PART 5 — SUGGESTION STYLE RULES
-- All improvement suggestions must be grounded in visible evidence, specific when possible, conservative when uncertain, visually honest, and free from fake precision.
-- Avoid generic "add accessories" filler unless a specific, visually justified accessory change is clearly supported by the image.
-- Prefer observations about silhouette, balance and proportion, visible color coordination, and overall outfit completeness based on what is actually visible in the frame.
-`;
-
-const CONSERVATIVE_TAILORING_RULES = `
-CONSERVATIVE TAILORING AND FIT ADVICE — BE VERY RESTRAINED:
-
-PART 1 — DO NOT RECOMMEND MORE FITTED IF THE GARMENT ALREADY READS FITTED
-- If a garment already appears close-fitting, body-skimming, silhouette-defining, structured through the torso, or clearly shaped at the waist, do NOT recommend making it more fitted.
-- Examples: do not suggest a fitted tank top should be more fitted; do not suggest a slim button-up should be tighter if it already reads close to the body; do not suggest more waist definition if the waistline is already visually clear.
-
-PART 2 — REQUIRE STRONG EVIDENCE BEFORE SUGGESTING TIGHTER FIT
-- Only suggest a more fitted garment when ALL of the following are true:
-  1) the garment clearly appears loose or boxy in a way that materially weakens the silhouette,
-  2) that looseness is visually obvious from the image, and
-  3) the relevant garment area is clearly visible.
-- If any of these are unclear (fit ambiguous, crop/pose hides the area, fabric behavior is hard to interpret), do NOT recommend a tighter fit.
-
-PART 3 — PREFER OBSERVATIONAL LANGUAGE OVER PRESCRIPTIVE TIGHTENING
-- When discussing fit, prefer neutral, observational language such as:
-  - "The top reads relaxed through the torso."
-  - "The silhouette is softer than sharp."
-  - "The cut leans easy rather than tailored."
-- Avoid prescriptive tightening language like:
-  - "It should be more fitted."
-  - "Tighten the waist."
-  - "Wear something tighter."
-- Only recommend a fit change when it is clearly justified by strong visual evidence.
-
-PART 4 — IF THE TOP ALREADY DEFINES THE WAIST, TREAT THAT AS A STRENGTH
-- When a top already creates a clean waistline or flattering shape, treat that as a positive rather than a weakness.
-- Better examples: "The fitted top creates a clear waistline."; "The top already gives the outfit a clean, streamlined shape."
-
-PART 5 — DO NOT FORCE SILHOUETTE ADVICE
-- If the silhouette already appears to be working well, do NOT invent silhouette-improvement advice just to fill a section.
-- It is acceptable to return fewer suggestions instead of forcing weak fit advice when the overall silhouette reads strong and coherent.
-
-- In general, avoid highly specific tailoring advice unless the visual evidence is extremely clear. Garment fit is often ambiguous in photos.
-- Do NOT casually recommend: tighter fit, looser fit, more tailored waist, more fitted through the torso, or similar alteration-style advice. Such recommendations are often wrong when the garment already appears appropriately fitted.
-- If garment fit is unclear due to pose, crop, fabric behavior, body angle, or image quality, do NOT give directional fit advice. Instead say something like "Fit is hard to judge precisely from this angle—avoid a strong tailoring recommendation."
-- Prefer OBSERVATIONAL language over prescriptive tailoring advice. Describe how the fit reads visually; describe silhouette and proportion; describe whether the outfit reads relaxed, streamlined, boxy, sharp, oversized, or structured. Do not tell the user to alter the garment unless it is truly obvious.
-- BAD examples (do not say): "The shirt should be more fitted", "The shirt should be looser", "Tailor the waist more", "This top would benefit from a looser fit".
-- BETTER examples: "The shirt already reads as close-fitting", "The silhouette is streamlined", "The top reads slightly relaxed, which softens the overall shape", "Fit is hard to judge precisely from this angle."
-- Prioritize styling, silhouette, and outfit balance over tailoring advice. If an improvement is needed, suggest styling changes (e.g. tuck, layer, proportion, color, accessory) before any alteration or fit-change advice. Only recommend fit changes when truly obvious from the image.
-`;
-
-const EVALUATION_PRIORITIES = `
-SCORING PRIORITIES (outfit over photo):
-1. Fit/tailoring of clothing (40%): How well garments fit—shoulders, waist, length, how pieces sit on the body.
-2. Color coordination and palette balance (25%): How colors work together across the outfit.
-3. Proportion and silhouette (20%): Balance between top and bottom, layering, overall shape.
-4. Style cohesion and occasion appropriateness (10%): How well the look holds together and fits the purpose.
-5. Photo clarity and framing (5%): Only whether the outfit is visible enough to evaluate. If the outfit is visible, score this 7.0 or higher. Do NOT penalize for background, lighting, or framing unless the outfit cannot be seen clearly. The score must reflect the OUTFIT itself, not the quality of the photo.`;
-
-const CORE_PHILOSOPHY = `
-CORE: The score reflects OUTFIT QUALITY, not photo quality. Do NOT heavily penalize a good outfit for background, lighting, or framing. Background matters only if the outfit is not visible. Do not judge personal attractiveness. Strong outfits score well even with busy backgrounds or imperfect lighting. Only mention photo/lighting/background in feedback if the outfit truly cannot be analyzed.`;
-
-function getPurposeFitGuidance(purpose: PhotoPurpose): string {
-  if (purpose === "dating") {
-    return `
-PURPOSE-FIT (dating): How well the outfit works for a dating context (warmth, approachability). Face visibility: mention only when genuinely relevant, as a soft suggestion, not a requirement. Do not lower scores for missing face if the outfit is strong.`;
-  }
-  if (purpose === "social" || purpose === "professional") {
-    return `
-PURPOSE-FIT (${purpose}): How well the outfit fits the purpose. Mention face or setting only when relevant; outfit-first.`;
-  }
-  return "";
-}
-
-const IMPROVE_FIT_SYSTEM_PROMPT = `
-You are an outfit improvement assistant. (1) Validate: set isValid true unless the image clearly has no person (landscape, food, pet, object, meme). (2) If valid, look at the outfit in the image and output up to 3 concise, specific improvement suggestions. Prefer giving fewer suggestions over speculative ones when the outfit is already working well.
-
-VISIBILITY — only suggest changes for what is clearly visible:
-- Do NOT suggest hemming pants, shortening pants, pant break, or any pant-length advice unless the leg/hem is clearly visible. Do not mention footwear or shoe choice unless feet/shoes are visible. Do not suggest hemming sleeves or tailoring cuffs unless sleeve ends are visible.
-- Ground every suggestion in a garment or detail that is clearly visible in the image. If an area is cropped out or not visible, do not make a suggestion about it.
-
-GROUNDED STYLING FACTS AND SUGGESTIONS:
-- First, identify key visible styling facts: whether the top is tucked or untucked; whether bracelets, watches, necklaces, rings, bags, or other accessories are visible; whether shoes/footwear are visible; whether earrings or the ear area are clearly visible; whether the waistband/waistline styling is visible.
-- Do NOT recommend a styling action that is already clearly present (e.g. do NOT suggest tucking in a top that is already tucked; do NOT suggest bracelets if bracelets or a watch are already visible).
-- Do NOT suggest earrings unless the ears or ear area are clearly visible and the idea is visually justified. Do NOT suggest belt or waistband changes unless the waist area is clearly visible. Do NOT suggest shoe changes unless footwear is clearly visible.
-- Avoid hidden or speculative details. If a styling area is cropped out, covered, or unclear, either stay silent or briefly acknowledge that it is not visible enough to judge.
-- Improvement suggestions must be based on visible evidence, not generic fashion filler. Avoid vague advice like "add accessories" without tying it to a clearly visible area.
-- If a styling area is already working well, it is acceptable to leave it as-is rather than forcing an improvement.
-- When uncertain, default to conservative, visually honest feedback instead of precise-sounding but speculative recommendations.
-  In particular, do NOT suggest that a top should be "more fitted" or "tighter" when it already appears close-fitting, body-skimming, or clearly defining the waistline.
-
-RULES FOR improvementSuggestions:
-- Reference clothing visible in the image when possible (e.g. "The overshirt could be worn open to break up the block of color", "Tucking the hem of the tee would sharpen the waistline") and ensure the change you suggest is not already clearly present.
-- Avoid generic advice. Do not say things like "consider balance", "try adding an accessory", or "check that colors work" without naming what you see (e.g. which garment, which color, which area).
-- Focus only on practical outfit adjustments for VISIBLE elements: fit adjustments (tuck, cuff, how something is worn), color balance (between visible pieces), layering (order, opening a layer), accessories (belt, watch, bag, jewelry) that build on what is already there. Mention footwear only if shoes are clearly visible. Do not suggest alterations (hem, tailor, shorten) unless that part of the garment is clearly visible.
-- Do not give camera, lighting, framing, or photo-quality advice. Only outfit and styling.
-- Output up to 3 suggestions. Each suggestion one short sentence. It is acceptable to return fewer than 3 suggestions, or even none, when there is no honest, evidence-based recommendation. Ground every suggestion in what is visible (specific garment or detail).
-
-Output single JSON only. No markdown.
-{ "isValid": bool, "validationMessage": null|string, "reason": null|"no_person_detected"|"outfit_not_visible"|"image_not_relevant"|"framing_too_unclear", "improvementSuggestions": ["suggestion 1", "suggestion 2", "suggestion 3"] }
-`;
-
-function getFullAnalysisSystemPrompt(purpose: PhotoPurpose): string {
-  if (purpose === "improve_fit") {
-    return IMPROVE_FIT_SYSTEM_PROMPT;
-  }
-  const focus: Record<Exclude<PhotoPurpose, "improve_fit">, string> = {
-    outfit: "Fit, proportions, color, layering, silhouette, cohesion.",
-    dating: "How well the outfit works for a dating context; warmth and approachability of the look.",
-    social: "How well the outfit works for social sharing; impact and cohesion of the look.",
-    professional: "How well the outfit works for a professional context; polish and cohesion.",
-    compare: "Outfit clarity and presentation for comparison.",
-  };
-  const purposeBlock = getPurposeFitGuidance(purpose);
-
-  return `You are an outfit evaluation assistant. Your primary goal is to evaluate the clothing and styling of the person in the image. (1) Validate: isValid true unless clearly no person (landscape, food, pet, object, meme). (2) If valid, follow the reasoning process below, then use the PROVIDED numeric subscores and overall score to give feedback. Do NOT change or re-score these numbers. All feedback and suggestions must be grounded in the visible facts and must respect the visibility and styling rules below.
-${REASONING_PROCESS}
-${VISIBILITY_GROUNDING_RULES}
-${GROUNDED_STYLING_SUGGESTIONS_RULES}
-${EVIDENCE_BASED_FIT_RULES}
-${CONSERVATIVE_TAILORING_RULES}
-${EVALUATION_PRIORITIES}
-${CORE_PHILOSOPHY}
-
-Purpose: ${purpose}. ${focus[purpose as Exclude<PhotoPurpose, "improve_fit">]}
-${purposeBlock}
-
-SUBScores (one decimal each, 0.0–10.0). Weight in overall: composition 60%, presentation 25%, purposeFit 10%, lighting 5%.
-- composition: Fit/tailoring of clothing (how garments fit—shoulders, waist, length) AND proportion/silhouette (balance, layering, overall shape). Primary driver of score.
-- presentation: Color coordination and palette balance across the outfit.
-- purposeFit: Overall style cohesion and how well the look fits the chosen occasion/purpose.
-- lighting: Photo clarity and whether the outfit is visible enough to evaluate. If the outfit is clearly visible, score 7.0 or higher. Do NOT penalize for background, lighting, or framing. Only lower this if the outfit cannot be seen clearly.
-
-FEEDBACK BEHAVIOR — outfit-first. Reference specific garments. Do not penalize or criticize photo quality unless the outfit truly cannot be analyzed.
-
-- What Works (output as "strengths"): Highlight outfit elements that work well—only for garments/details clearly visible (e.g. "Jacket fit is clean at the shoulders", "Shirt and trouser color balance works well"). Mention footwear or shoes only if feet/shoes are visible; otherwise omit. No generic praise. Do not mention lighting or background unless the outfit is hard to see.
-- Could Improve (output as "improvements"): Only clothing-related issues you can clearly see in the image (fit, color, proportion, silhouette). Do NOT suggest hemming, shortening, or adjusting pants/sleeves/cuffs/footwear unless those areas are clearly visible. Do NOT mention lighting, background, or framing unless the outfit cannot be seen clearly. 0–3 points. Prefer observational language and avoid forcing weak issues when the outfit already reads clean and complete.
-- Suggestions: 0–3 concrete outfit suggestions referencing only visible clothing (tuck, layer, color, accessory). It is acceptable to return fewer than 3 suggestions (including none) when the outfit already looks coherent and complete or when no strong, evidence-based changes are apparent. Mention footwear only if shoes are visible. Do not suggest hemming, tailoring hems/cuffs, or changing shoe choice unless those elements are clearly visible in the photo. No generic camera advice.
-- analysisTips (output as "analysisTips"): Only include tips here if the outfit truly cannot be analyzed (e.g. too dark, cropped so outfit is missing). If the outfit is visible and evaluable, output an empty array []. Do NOT give generic tips like "use better lighting" or "avoid cluttered background" when the outfit was clearly evaluable.
-
-Do not repeat the same point across sections. Tone: concise, fit-check style. Score and feedback must reflect the outfit, not the photo.
-
-Output single JSON only. No markdown.
-{ "isValid": bool, "validationMessage": null|string, "reason": null|"no_person_detected"|"outfit_not_visible"|"image_not_relevant"|"framing_too_unclear", "score": number|null, "subscores": { "composition", "lighting", "presentation", "purposeFit" }|null, "strengths": [], "improvements": [], "suggestions": [], "analysisTips": [] }`;
-}
-
-function clampSubscore(value: unknown): number {
-  const n = typeof value === "number" ? value : Number(value);
-  if (Number.isNaN(n)) return 7;
-  return roundToOneDecimal(n);
-}
-
-function parseSubscores(parsed: Record<string, unknown>, fallbackScore: number): AnalysisSubscores {
-  const raw = parsed.subscores;
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
-    return subscoresFromScore(fallbackScore);
-  }
-  const obj = raw as Record<string, unknown>;
-  return {
-    composition: clampSubscore(obj.composition),
-    lighting: clampSubscore(obj.lighting),
-    presentation: clampSubscore(obj.presentation),
-    purposeFit: clampSubscore(obj.purposeFit),
-  };
-}
-
-// --- Stage 1: Visible facts extraction ---
+// --- Visible facts types and parsing (used by single-request flow) ---
 
 type BodyCropType = "full_body" | "upper_body" | "mid_body" | "close_crop" | "unclear";
 type FitDescriptor = "fitted" | "relaxed" | "oversized" | "unclear";
@@ -540,53 +308,56 @@ function putCachedAnalysis(
   }
 }
 
-const VISIBLE_FACTS_SYSTEM_PROMPT = `
-You are a vision helper for a style app. In this step you ONLY output one compact JSON object describing what is clearly visible in the image. Do NOT give style advice, opinions, or extra text.
+// --- Single-request combined prompt (replaces separate visible-facts + grounded-analysis calls) ---
+const COMBINED_SINGLE_REQUEST_SYSTEM = `You are an outfit analysis assistant. Output ONE JSON object only. No markdown. Evaluate the outfit like a real stylist doing a fit check.
 
-Rules:
-- Reply with ONE JSON object only. No markdown, no explanations, no commentary.
-- Use the exact keys and types listed below.
-- When something is not clearly visible, use "unclear" for enums or null for strings.
-- For all free-text string fields, keep values extremely short: ideally 1–3 simple words, no commas, no full sentences. If you would need a longer phrase, use null instead.
- - For *_visible boolean fields (shoe_visible, belt_visible, bracelets_visible, watch_visible, necklace_visible, ring_visible, waist_visible, waist_definition_visible), follow this rule:
-   - true if the item/area is clearly and unambiguously visible in the frame,
-   - false only if that area is clearly visible AND the item is clearly not present,
-   - null when the area is cropped out, obscured, or too ambiguous to judge.
+CRITICAL RULE — THIS IS A FIT CHECK, NOT A PHOTO CRITIQUE
+This is a fit-check / stylist app. The subject of analysis is the person, the outfit, and how the clothing fits and works on the body. This is NOT a photography critique. The following topics are OUT OF SCOPE and must NOT appear in strengths, improvements, suggestions, or improvementSuggestions unless the outfit is genuinely impossible to evaluate: image orientation, rotating the image, cropping the image, framing, negative space, cleaner or simpler background, cluttered background, room or scenery distractions, lighting improvements, softer light sources, better camera angle, central positioning, photo composition advice, or any other camera/photography tips. If the outfit is visible enough to judge, completely ignore these topics. Only when the clothing truly cannot be judged may you mention visibility issues, and those belong ONLY in analysisTips (not in outfit feedback sections).
 
-Fields (keys) to return:
-- person_visible: boolean
-- body_crop_type: "full_body" | "upper_body" | "mid_body" | "close_crop" | "unclear"
-- top_type: short text like "tank top", "t-shirt", "button-up", or null (1–3 words, no commas)
-- top_fit: "fitted" | "relaxed" | "oversized" | "unclear"
-- top_tucked: true | false | null (null when unclear or mixed)
-- outerwear_visible: boolean | null
-- bottom_type: short text like "jeans", "trousers", "shorts", or null (1–3 words, no commas)
-- bottom_fit: "fitted" | "relaxed" | "oversized" | "unclear"
-- waist_visible: boolean | null
-- waist_definition_visible: boolean | null (true if the waistline is clearly defined by fit, cut, or styling)
-- shoe_visible: boolean | null
-- pant_hem_visible: boolean | null (true only if the lower pant edge / hem area is clearly visible)
-- sleeve_visible: boolean | null
-- cuff_visible: boolean | null
-- ear_visibility: "visible" | "hidden" | "unclear"
-- hair_visibility: very short text or null (1–3 words, no commas)
-- necklace_visible: boolean | null
-- bracelets_visible: boolean | null
-- watch_visible: boolean | null
-- ring_visible: boolean | null
-- belt_visible: boolean | null
-- accessory_summary: very short text summary of visible accessories, or null (1–3 words, no commas)
-- color_palette_summary: very short text summary of the main colors, or null (1–3 words, no commas)
-- silhouette_read: very short text like "streamlined", "boxy", "relaxed", or null (1–3 words, no commas)
-- background_simple_or_busy: "simple" | "busy" | "unclear"
-- lighting_quality: very short text like "even", "harsh", "dim", or null (1–3 words, no commas)
-- outfit_visibility_quality: very short text describing how clearly the outfit can be seen, or null (1–3 words, no commas)
+FIT-FIRST RULE
+The most important part of the analysis is how the clothing fits and shapes the person. Pay close attention to: whether garments look fitted, relaxed, oversized, boxy, or shapeless; whether the outfit defines or hides shape; whether the silhouette looks balanced or awkward; whether top and bottom proportions work together; whether the outfit reads intentional and put-together or casual/sloppy.
 
-Output:
-- Only the JSON object, nothing else.`;
+SILHOUETTE RULE
+Explicitly evaluate silhouette and overall visual shape. Consider: waist definition; top-to-bottom balance; whether the outfit looks streamlined or bulky; whether layers improve or hurt the shape; whether the look has structure or feels amorphous. Prioritize silhouette comments over generic comments.
 
-const VISIBLE_FACTS_USER_PROMPT =
-  "Look at the image and reply with a single JSON object containing the requested visible facts. Do not add any extra keys or commentary.";
+PROPORTION RULE
+Carefully evaluate proportion between visible garments. Examples: fitted top with balanced bottom; oversized top with overly relaxed bottom causing a shapeless look; top length affecting leg line; visual balance between upper and lower body; whether the overall look appears clean, intentional, and proportionate. If proportions are strong, call that out as a strength. If proportions are weak, mention that in improvements or suggestions.
+
+PERSON-FIRST RULE
+Judge how the outfit works ON THE PERSON, not how clothes look in isolation. Focus on: how the clothes sit on the body; whether the outfit flatters the wearer's visible shape; whether the styling enhances the person's overall presentation. Do not just identify garments; interpret how they work together on the person.
+
+COMPOSITION VS PHOTO COMPOSITION
+When you think about "composition", you are judging the outfit composition on the body: silhouette, fit, proportion, and the visual balance of clothing on the person. Do NOT treat composition as photo framing, centering, negative space, or camera positioning.
+
+BACKGROUND & LIGHTING RULE
+Ignore the background and camera composition unless they directly prevent the outfit from being evaluated. Do NOT comment on cluttered rooms, scenery, framing, centering, camera angle, negative space, or lighting setups unless the outfit cannot be seen well enough to judge. Written feedback must stay focused on outfit quality: fit, silhouette, proportion, coordination, styling, visible accessories.
+
+SECTION GUIDANCE
+What Works: Emphasize flattering fit, strong silhouette, clean proportions, cohesive styling, and visible outfit strengths on the person.
+Could Improve: Emphasize weak fit, shapelessness, imbalance, awkward proportion, and visible styling mismatches.
+Suggestions: Suggest ways to improve shape, balance, proportion, styling, or visible coordination. Suggestions should feel like a stylist improving the outfit, not a photographer improving the image.
+
+TONE
+Write like a modern stylist or fit-check expert: concise, visual, outfit-focused, grounded in what is visible, not generic, not overly technical.
+
+1) visible_facts: What is clearly visible. Use exact keys. Booleans: true/false/null (null when area not visible). Enums: use listed values or "unclear". Strings: 1-3 words max.
+Keys: person_visible (boolean), body_crop_type (full_body|upper_body|mid_body|close_crop|unclear), top_type, top_fit (fitted|relaxed|oversized|unclear), top_tucked (bool|null), outerwear_visible, bottom_type, bottom_fit, waist_visible, waist_definition_visible, shoe_visible, pant_hem_visible, sleeve_visible, cuff_visible, ear_visibility (visible|hidden|unclear), hair_visibility, necklace_visible, bracelets_visible, watch_visible, ring_visible, belt_visible, accessory_summary, color_palette_summary, silhouette_read, background_simple_or_busy (simple|busy|unclear), lighting_quality, outfit_visibility_quality.
+
+2) If person_visible is false, set strengths=[], improvements=[], suggestions=[], analysisTips=[], improvementSuggestions=[] and return.
+
+3) STRENGTHS: 2–4 short positives. Emphasize flattering fit, strong silhouette, clean proportions, cohesive styling. Outfit only; no background/scenery/lighting unless visibility is poor.
+
+4) IMPROVEMENTS: 0–3 weaknesses. Emphasize weak fit, shapelessness, imbalance, awkward proportion, styling mismatches. Outfit only; no cleaner background/better lighting/framing unless the outfit cannot be evaluated.
+
+5) SUGGESTIONS: 0–3 actionable tips. Focus on improving shape, balance, proportion, styling, coordination — like a stylist, not a photographer. Do NOT suggest tucking if top already tucked; do NOT suggest adding belt/bracelets/watch/necklace/rings if already visible; do NOT suggest hem/shoe/sleeve changes unless that area is clearly visible.
+
+6) analysisTips: Only when the outfit is hard to evaluate (e.g. too dark, cropped). One short visibility tip if needed. If the outfit is clearly visible, analysisTips must be [].
+
+7) improvementSuggestions: 0–3 outfit-only (same rules as suggestions). No photography or environment advice.`;
+
+function getCombinedUserPrompt(purpose: PhotoPurpose): string {
+  return `Analyze this outfit image. Purpose: ${purpose}. Reply with one JSON: { "visible_facts": {...}, "strengths": [], "improvements": [], "suggestions": [], "analysisTips": [], "improvementSuggestions": [] }.`;
+}
 
 function coerceBooleanOrNull(value: unknown): boolean | null {
   if (typeof value === "boolean") return value;
@@ -692,38 +463,54 @@ function extractJSONObjectSegment(text: string): string | null {
   return text.slice(firstBrace, lastBrace + 1);
 }
 
-function tryParseVisibleFactsFromString(
+/** Result of parsing the single combined API response (visible_facts + text arrays). */
+interface SingleCombinedParseResult {
+  visibleFacts: VisibleFacts;
+  visibleFactsFromFallback: boolean;
+  strengths: string[];
+  improvements: string[];
+  suggestions: string[];
+  analysisTips: string[];
+  improvementSuggestions: string[];
+}
+
+function parseSingleCombinedResponse(
   raw: string,
   runId?: string
-): { parsed: Record<string, unknown> | null; usedRepair: boolean; errorMessage?: string } {
+): SingleCombinedParseResult | null {
   let cleaned = stripMarkdownFences(raw);
-
-  // First attempt: direct parse.
+  let parsed: Record<string, unknown>;
   try {
-    const direct = JSON.parse(cleaned) as Record<string, unknown>;
-    return { parsed: direct, usedRepair: false };
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    console.log(`${LOG_PREFIX} visible-facts direct JSON parse failed`, { runId, message });
+    parsed = JSON.parse(cleaned) as Record<string, unknown>;
+  } catch {
+    const segment = extractJSONObjectSegment(cleaned);
+    if (!segment) return null;
+    try {
+      parsed = JSON.parse(segment) as Record<string, unknown>;
+    } catch {
+      return null;
+    }
   }
 
-  // Second attempt: extract first JSON object-looking segment.
-  const segment = extractJSONObjectSegment(cleaned);
-  if (!segment) {
-    return {
-      parsed: null,
-      usedRepair: true,
-      errorMessage: "No JSON object delimiters found",
-    };
+  const visibleFactsRaw = parsed.visible_facts;
+  let visibleFacts: VisibleFacts = { ...DEFAULT_VISIBLE_FACTS };
+  let visibleFactsFromFallback = true;
+  if (visibleFactsRaw && typeof visibleFactsRaw === "object" && !Array.isArray(visibleFactsRaw)) {
+    visibleFacts = parseVisibleFacts(visibleFactsRaw);
+    visibleFactsFromFallback = false;
   }
 
-  try {
-    const repaired = JSON.parse(segment) as Record<string, unknown>;
-    return { parsed: repaired, usedRepair: true };
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    return { parsed: null, usedRepair: true, errorMessage: message };
-  }
+  const arr = (key: string): string[] =>
+    Array.isArray(parsed[key]) ? (parsed[key] as unknown[]).map(String) : [];
+  return {
+    visibleFacts,
+    visibleFactsFromFallback,
+    strengths: arr("strengths"),
+    improvements: arr("improvements"),
+    suggestions: arr("suggestions"),
+    analysisTips: arr("analysisTips"),
+    improvementSuggestions: arr("improvementSuggestions"),
+  };
 }
 
 function classifyEvaluability(facts: VisibleFacts): EvaluabilityState {
@@ -1028,6 +815,128 @@ const GENERIC_PHRASES = new Set([
   "add jewelry", "add some jewelry", "try adding jewelry",
 ]);
 
+/** Substrings that indicate feedback is about background/framing/lighting/photo rather than the outfit. */
+const BACKGROUND_FOCUSED_PATTERNS = [
+  "cleaner background", "simpler background", "less cluttered background", "clearer background",
+  "better background", "neutral background", "plain background", "uncluttered background",
+  "better framing", "improve framing", "tighter framing", "framing could", "crop the",
+  "crop image", "crop the image", "cropping the image",
+  "improve lighting", "better lighting", "lighting could", "softer lighting", "natural lighting",
+  "photo could", "picture could", "shot could", "camera angle", "try a different angle",
+  "step back", "zoom out", "full body shot", "better photo", "retake", "take another",
+  "background is", "background distracts", "busy background", "cluttered background",
+  "framing is", "lighting is", "too dark", "too bright", "backlit", "shadow",
+  "upside down", "image is upside down", "rotate the image", "rotate the photo", "image orientation",
+  "visual distractions", "reduce distractions", "photo clarity", "composition of the photo",
+  "negative space", "too much negative space", "unbalanced composition", "composition is unbalanced",
+  "position yourself centrally", "position yourself in the center", "center of the frame", "central in the frame",
+  "lighting is uneven", "image is dark", "photo is dark", "partially dark",
+];
+
+/** Hard banned photo/scene critique phrases; these should never appear in outfit feedback sections. */
+const PHOTO_CRITIQUE_PATTERNS = [
+  "image is upside down",
+  "upside down",
+  "rotate the image",
+  "rotate the photo",
+  "rotation of the image",
+  "image orientation",
+  "rotate for better viewing",
+  "crop the image",
+  "crop image",
+  "cropping the image",
+  "better framing",
+  "improve framing",
+  "framing of the photo",
+  "cleaner background",
+  "simpler background",
+  "cluttered background",
+  "background is slightly cluttered",
+  "room distractions",
+  "scenery distractions",
+  "visual distractions",
+  "reduce distractions",
+  "improve lighting",
+  "enhance lighting",
+  "lighting is flat",
+  "lighting is shadowed",
+  "lighting is too dark",
+  "lighting is too bright",
+  "photo clarity",
+  "better camera angle",
+  "camera angle",
+  "composition of the photo",
+  "composition is unbalanced",
+  "unbalanced composition",
+  "too much negative space",
+  "negative space",
+  "position yourself centrally",
+  "position yourself in the center",
+  "center of the frame",
+  "central in the frame",
+  "lighting is uneven",
+  "image is dark",
+  "photo is dark",
+  "image is partially dark",
+  "photo is partially dark",
+  "soft light source",
+  "softer light source",
+  "fill light",
+  "improve clarity",
+  "better clarity",
+  "highlight the outfit better",
+  "focus more on the outfit",
+];
+
+/** True when feedback text is clearly about photo/background/lighting and should be blocked from outfit sections. */
+function isPhotoCritiqueFeedback(text: string): boolean {
+  const n = normalizeForDedupe(text);
+  for (const pattern of PHOTO_CRITIQUE_PATTERNS) {
+    if (n.includes(pattern)) return true;
+  }
+  return false;
+}
+
+/** True when the feedback text is primarily about background, framing, lighting, or photo setup (not the outfit). */
+function isBackgroundFocusedFeedback(text: string): boolean {
+  const n = normalizeForDedupe(text);
+  for (const pattern of BACKGROUND_FOCUSED_PATTERNS) {
+    if (n.includes(pattern)) return true;
+  }
+  const words = n.split(/\s+/);
+  const backgroundWords = ["background", "framing", "lighting", "photo", "camera", "shot", "angle", "clutter", "cluttered"];
+  const count = words.filter((w) => backgroundWords.some((b) => w.includes(b))).length;
+  if (count >= 2) return true;
+  if (words.length <= 6 && count >= 1 && !n.includes("outfit") && !n.includes("fit") && !n.includes("color") && !n.includes("silhouette")) return true;
+  return false;
+}
+
+/** True when visible_facts indicate the outfit is hard to evaluate (poor visibility). */
+function isOutfitVisibilityPoor(facts: VisibleFacts): boolean {
+  const v = (facts.outfit_visibility_quality ?? "").toLowerCase();
+  return (
+    v.includes("hard") ||
+    v.includes("poor") ||
+    v.includes("unclear") ||
+    v.includes("limited") ||
+    v.includes("barely") ||
+    v.includes("cannot see") ||
+    v.includes("parse_failed")
+  );
+}
+
+/** Remove background/framing/lighting-focused items when the outfit is clearly visible. */
+function dropBackgroundFocusedWhenVisible(items: string[], facts: VisibleFacts): string[] {
+  if (isOutfitVisibilityPoor(facts)) return items;
+  return items.filter((s) => {
+    const drop = isBackgroundFocusedFeedback(s);
+    if (drop && ANALYSIS_DEBUG_ENABLED) {
+      console.log(`${LOG_PREFIX} dropped background-focused feedback (outfit clearly visible)`, { text: s });
+    }
+    return !drop;
+  });
+}
+
 function normalizeForDedupe(s: string): string {
   return s.toLowerCase().replace(/\s+/g, " ").trim();
 }
@@ -1149,234 +1058,23 @@ function sanitizeFeedbackItems(items: string[]): string[] {
     });
 }
 
-// Normalize raw score from the AI into a safe 0–10 value, with robust parsing and logging.
-function normalizeScore(value: unknown): number {
-  let extracted: number | null = null;
-
-  if (typeof value === "number") {
-    extracted = value;
-  } else if (typeof value === "string") {
-    const match = value.match(/-?\d+(\.\d+)?/);
-    if (match) {
-      extracted = Number(match[0]);
-    }
-  }
-
-  if (extracted === null || Number.isNaN(extracted)) {
-    console.log(`${LOG_PREFIX} normalizeScore: fallback used`, {
-      rawScore: value,
-      normalizedScore: 5.5,
-    });
-    return roundToOneDecimal(5.5);
-  }
-
-  // If the model explicitly returned 0, allow 0. Otherwise avoid collapsing bad values to 0.
-  if (extracted < 0) {
-    if (extracted === 0) {
-      console.log(`${LOG_PREFIX} normalizeScore: clamped explicit 0`, {
-        rawScore: value,
-        normalizedScore: 0,
-      });
-      return 0;
-    }
-    console.log(`${LOG_PREFIX} normalizeScore: negative score treated as invalid, using 5.5`, {
-      rawScore: value,
-      parsedNumeric: extracted,
-      normalizedScore: 5.5,
-    });
-    return roundToOneDecimal(5.5);
-  }
-
-  let clamped = extracted;
-  if (extracted > 10) clamped = 10;
-
-  const normalized = roundToOneDecimal(clamped);
-  console.log(`${LOG_PREFIX} normalizeScore: normalized`, {
-    rawScore: value,
-    parsedNumeric: extracted,
-    normalizedScore: normalized,
-  });
-  return normalized;
-}
-
-function parseFullResponse(parsed: unknown, debug?: AnalysisDebugInfo | null): AnalysisResponse | null {
-  if (!parsed || typeof parsed !== "object") return null;
-  const p = parsed as Record<string, unknown>;
-
-  const isValid = p.isValid === true;
-  const validationMessage =
-    p.validationMessage != null && typeof p.validationMessage === "string"
-      ? String(p.validationMessage).trim()
-      : null;
-  const reason = isValidationReason(p.reason) ? p.reason : null;
-
-  if (!isValid) {
-    const message =
-      validationMessage && validationMessage.length > 0
-        ? validationMessage
-        : "This photo doesn't appear suitable for analysis.";
-    const validReason = reason ?? "image_not_relevant";
-    return {
-      isValid: false,
-      validationMessage: message,
-      reason: validReason,
-      score: null,
-      subscores: null,
-      strengths: [],
-      improvements: [],
-      suggestions: [],
-      analysisTips: [],
-      improvementSuggestions: [],
-    };
-  }
-
-  const rawImprovementSuggestions = Array.isArray(p.improvementSuggestions)
-    ? p.improvementSuggestions.map(String)
-    : [];
-  const improvementSuggestions = sanitizeFeedbackItems(rawImprovementSuggestions).slice(0, 3);
-
-  if (debug) {
-    debug.rawGroundedImprovements = Array.isArray(p.improvements)
-      ? (p.improvements as unknown[]).map(String)
-      : [];
-    debug.rawGroundedStrengths = Array.isArray(p.strengths)
-      ? (p.strengths as unknown[]).map(String)
-      : [];
-    debug.rawGroundedSuggestions = Array.isArray(p.suggestions)
-      ? (p.suggestions as unknown[]).map(String)
-      : [];
-  }
-
-  const scoreRaw = p.score;
-  if (debug) {
-    debug.rawModelScore = scoreRaw;
-  }
-  const fallbackScore = normalizeScore(scoreRaw);
-  if (debug) {
-    debug.normalizedScore = fallbackScore;
-  }
-
-  const subscores = parseSubscores(p, fallbackScore);
-
-  const score =
-    subscores != null
-      ? overallFromSubscores(subscores)
-      : fallbackScore;
-
-  const rawStrengths = Array.isArray(p.strengths) ? p.strengths.map(String) : [];
-  const rawImprovements = Array.isArray(p.improvements) ? p.improvements.map(String) : [];
-  const rawSuggestions = Array.isArray(p.suggestions) ? p.suggestions.map(String) : [];
-  const rawAnalysisTips = Array.isArray(p.analysisTips) ? p.analysisTips.map(String) : [];
-
-  const strengthsSanitized = sanitizeFeedbackItems(rawStrengths);
-  const improvementsSanitized = sanitizeFeedbackItems(rawImprovements);
-  const suggestionsSanitized = sanitizeFeedbackItems(rawSuggestions);
-
-  if (ANALYSIS_DEBUG_ENABLED) {
-    console.log(`${LOG_PREFIX} stage2 text — raw`, {
-      strengths: rawStrengths,
-      improvements: rawImprovements,
-      suggestions: rawSuggestions,
-    });
-    console.log(`${LOG_PREFIX} stage2 text — after sanitizeFeedbackItems`, {
-      strengths: strengthsSanitized,
-      improvements: improvementsSanitized,
-      suggestions: suggestionsSanitized,
-    });
-  }
-
-  let strengths = strengthsSanitized.filter(
-    (s) => !isGeneric(s, { section: "strengths", runId: debug?.fingerprint })
-  );
-  let improvements = improvementsSanitized.filter(
-    (s) => !isGeneric(s, { section: "improvements", runId: debug?.fingerprint })
-  );
-  let suggestions = suggestionsSanitized.filter(
-    (s) => !isGeneric(s, { section: "suggestions", runId: debug?.fingerprint })
-  );
-
-  if (ANALYSIS_DEBUG_ENABLED) {
-    console.log(`${LOG_PREFIX} stage2 text — after generic filter`, {
-      strengths,
-      improvements,
-      suggestions,
-    });
-  }
-
-  suggestions = dropCrossSectionDuplicates(suggestions, improvements);
-
-  if (ANALYSIS_DEBUG_ENABLED) {
-    console.log(`${LOG_PREFIX} stage2 text — after cross-section dedupe`, {
-      strengths,
-      improvements,
-      suggestions,
-    });
-  }
-
-  const analysisTips = sanitizeFeedbackItems(rawAnalysisTips);
-
-  const fallbackImprovements: string[] = [];
-  const fallbackSuggestions: string[] = [];
-  const usingFallbackStrengths = strengths.length === 0;
-  const usingFallbackImprovements = improvements.length === 0;
-  const finalSuggestions = suggestions.length > 0 ? suggestions : fallbackSuggestions;
-  const usingFallbackSuggestions = finalSuggestions.length === 0;
-
-  if (debug) {
-    debug.usedFallbackStrengths = usingFallbackStrengths;
-    debug.usedFallbackImprovements = usingFallbackImprovements;
-    debug.usedFallbackSuggestions = usingFallbackSuggestions;
-  }
-
-  const scoreExplanation = subscores ? deriveScoreExplanation(subscores) : null;
-
+/** Build the standard invalid AnalysisResponse (e.g. when person not visible). */
+function buildInvalidValidationResponse(reason: ValidationReason): AnalysisResponse {
   return {
-    isValid: true,
-    validationMessage: null,
-    reason: null,
-    score,
-    subscores,
-    strengths,
-    improvements: improvements.length > 0 ? improvements : fallbackImprovements,
-    suggestions: finalSuggestions,
-    analysisTips,
-    improvementSuggestions: improvementSuggestions.length > 0 ? improvementSuggestions : undefined,
-    scoreExplanation: scoreExplanation ?? undefined,
+    isValid: false,
+    validationMessage: "This photo doesn't appear suitable for analysis.",
+    reason,
+    score: null,
+    subscores: null,
+    strengths: [],
+    improvements: [],
+    suggestions: [],
+    analysisTips: [],
+    improvementSuggestions: [],
   };
 }
 
-/** Parse phase-1 validation-only response into an invalid AnalysisResponse when isValid is false. */
-function parseValidationResponse(raw: string): { valid: true } | { valid: false; response: AnalysisResponse } {
-  let parsed: Record<string, unknown>;
-  try {
-    parsed = JSON.parse(raw) as Record<string, unknown>;
-  } catch {
-    return { valid: true };
-  }
-  if (parsed.isValid === true) return { valid: true };
-  const validationMessage =
-    parsed.validationMessage != null && typeof parsed.validationMessage === "string"
-      ? String(parsed.validationMessage).trim()
-      : "This photo doesn't appear suitable for analysis.";
-  const reason = isValidationReason(parsed.reason) ? parsed.reason : "image_not_relevant";
-  return {
-    valid: false,
-    response: {
-      isValid: false,
-      validationMessage: validationMessage || "This photo doesn't appear suitable for analysis.",
-      reason,
-      score: null,
-      subscores: null,
-      strengths: [],
-      improvements: [],
-      suggestions: [],
-      analysisTips: [],
-      improvementSuggestions: [],
-    },
-  };
-}
-
-// --- Stage 3: contradiction / sanity cleanup ---
+// --- Contradiction / sanity cleanup ---
 
 function sanitizeContradictorySuggestions(
   facts: VisibleFacts,
@@ -1588,6 +1286,50 @@ function sanitizeContradictorySuggestions(
   };
 }
 
+/**
+ * Ensures the response always has the full shape expected by iOS: arrays are never undefined,
+ * score/subscores present when valid. Prevents decode/render crashes from malformed success responses.
+ */
+function ensureCompleteResponse(r: AnalysisResponse): AnalysisResponse {
+  const strengths = Array.isArray(r.strengths) ? r.strengths : [];
+  const improvements = Array.isArray(r.improvements) ? r.improvements : [];
+  const suggestions = Array.isArray(r.suggestions) ? r.suggestions : [];
+  const analysisTips = Array.isArray(r.analysisTips) ? r.analysisTips : [];
+  const improvementSuggestions = Array.isArray(r.improvementSuggestions) ? r.improvementSuggestions : undefined;
+
+  if (!r.isValid) {
+    return {
+      isValid: false,
+      validationMessage: r.validationMessage != null ? String(r.validationMessage) : "This photo doesn't appear suitable for analysis.",
+      reason: r.reason ?? "image_not_relevant",
+      score: null,
+      subscores: null,
+      strengths: [],
+      improvements: [],
+      suggestions: [],
+      analysisTips: [],
+      improvementSuggestions: [],
+    };
+  }
+
+  const subscores = r.subscores && typeof r.subscores === "object" && !Array.isArray(r.subscores)
+    ? r.subscores
+    : subscoresFromScore(6.5);
+  const score = typeof r.score === "number" && !Number.isNaN(r.score) ? roundToOneDecimal(r.score) : overallFromSubscores(subscores);
+
+  return {
+    ...r,
+    strengths,
+    improvements,
+    suggestions,
+    analysisTips,
+    improvementSuggestions: improvementSuggestions && improvementSuggestions.length > 0 ? improvementSuggestions : undefined,
+    score,
+    subscores,
+    scoreExplanation: r.scoreExplanation ?? deriveScoreExplanation(subscores),
+  };
+}
+
 export async function analyzePhotoWithAI(
   imageBase64: string,
   purpose: PhotoPurpose,
@@ -1600,14 +1342,21 @@ export async function analyzePhotoWithAI(
     if (ANALYSIS_DEBUG_ENABLED) {
       console.log(`${LOG_PREFIX} debug: getFallbackMockResult() used due to missing API key`);
     }
-    return getFallbackMockResult();
+    return ensureCompleteResponse(getFallbackMockResult());
   }
+
+  const t0 = Date.now();
+  console.log(`${LOG_PREFIX} request pipeline started`, { purpose, runId });
 
   try {
     const openai = new OpenAI({ apiKey });
     const model = getModel();
 
+    const tResize0 = Date.now();
     const compressedBase64 = await resizeAndCompressImage(imageBase64);
+    const imagePreprocessMs = Date.now() - tResize0;
+    console.log(`${LOG_PREFIX} phase image_preprocess_ms`, { imagePreprocessMs });
+
     const imageUrl = compressedBase64.startsWith("data:")
       ? compressedBase64
       : `data:image/jpeg;base64,${compressedBase64}`;
@@ -1626,167 +1375,112 @@ export async function analyzePhotoWithAI(
     const exactCached = ANALYSIS_CACHE.get(fingerprint);
     if (exactCached && exactCached.purpose === purpose) {
       exactCached.lastUsedAt = Date.now();
-      console.log(`${LOG_PREFIX} cache hit: exact image fingerprint`, { purpose });
+      console.log(`${LOG_PREFIX} cache hit: exact image fingerprint (bypassed for testing)`, {
+        purpose,
+      });
+      console.log(`${LOG_PREFIX} cache bypassed for testing`, { kind: "exact" });
       if (debugInfo) {
         debugInfo.cacheHitType = "exact";
-        debugInfo.finalStrengths = exactCached.response.strengths;
-        debugInfo.finalImprovements = exactCached.response.improvements;
-        debugInfo.finalSuggestions = exactCached.response.suggestions;
-        debugInfo.finalAnalysisTips = exactCached.response.analysisTips;
-        debugInfo.finalScore = exactCached.response.score;
-        logDebugSnapshot("exact_cache_return", debugInfo);
       }
-      return exactCached.response;
     }
 
-    // Skip phase-1 validation for improve_fit: the photo was already validated when we produced the result screen.
-    // Re-running validation can intermittently reject the same image and show "This photo doesn't appear suitable for analysis."
-    const skipPhase1Validation = purpose === "improve_fit";
+    // Single OpenAI round-trip: visible_facts + strengths/improvements/suggestions in one response.
+    const fullAnalysisDetail = "low";
+    const singleRequestMaxTokens = 350;
 
-    if (!skipPhase1Validation) {
-      console.log(`${LOG_PREFIX} OpenAI validation request started`);
-      const validationCompletion = await openai.chat.completions.create({
+    const tOpenAI0 = Date.now();
+    console.log(`${LOG_PREFIX} OpenAI single combined request started`, {
+      model,
+      purpose,
+      detail: fullAnalysisDetail,
+      max_tokens: singleRequestMaxTokens,
+    });
+    const completion = await withTimeout(
+      openai.chat.completions.create({
         model,
         messages: [
-          { role: "system", content: VALIDATION_SYSTEM },
+          { role: "system", content: COMBINED_SINGLE_REQUEST_SYSTEM },
           {
             role: "user",
             content: [
-              { type: "image_url", image_url: { url: imageUrl, detail: "low" } },
-              { type: "text", text: VALIDATION_USER },
+              { type: "image_url", image_url: { url: imageUrl, detail: fullAnalysisDetail } },
+              { type: "text", text: getCombinedUserPrompt(purpose) },
             ],
           },
         ],
         response_format: { type: "json_object" },
-        max_tokens: 80,
-      });
+        max_tokens: singleRequestMaxTokens,
+      }),
+      OPENAI_REQUEST_TIMEOUT_MS,
+      "Single combined analysis"
+    );
+    const openaiRequestMs = Date.now() - tOpenAI0;
+    console.log(`${LOG_PREFIX} phase openai_request_ms`, { openaiRequestMs });
 
-      console.log(`${LOG_PREFIX} OpenAI validation response received`);
-
-      const validationRaw = validationCompletion.choices[0]?.message?.content;
-      if (typeof validationRaw === "string") {
-        const validation = parseValidationResponse(validationRaw);
-        if (!validation.valid) {
-          console.log(`${LOG_PREFIX} guardrail check: failed`, {
-            reason: validation.response.reason,
-            purpose,
-          });
-          if (debugInfo) {
-            debugInfo.phase1Rejected = true;
-            debugInfo.phase1Reason = validation.response.reason ?? null;
-            debugInfo.finalStrengths = validation.response.strengths;
-            debugInfo.finalImprovements = validation.response.improvements;
-            debugInfo.finalSuggestions = validation.response.suggestions;
-            debugInfo.finalAnalysisTips = validation.response.analysisTips;
-            debugInfo.finalScore = validation.response.score;
-            logDebugSnapshot("phase1_validation_rejected", debugInfo);
-          }
-          return validation.response;
-        }
-      }
-      console.log(`${LOG_PREFIX} guardrail check: passed`);
-    } else {
-      console.log(`${LOG_PREFIX} improve_fit: skipping phase-1 validation (photo already validated)`);
+    const raw = completion.choices[0]?.message?.content;
+    if (!raw || typeof raw !== "string") {
+      console.log(`${LOG_PREFIX} single response missing or non-string`);
+      throw new InvalidAIResponseError("Empty or non-string AI response");
     }
 
-    const fullAnalysisDetail = "low";
-    const fullAnalysisMaxTokens = 400;
+    const tParse0 = Date.now();
+    const parsedCombined = parseSingleCombinedResponse(raw, runId);
+    const parseMs = Date.now() - tParse0;
+    console.log(`${LOG_PREFIX} phase parse_ms`, { parseMs });
 
-    // Stage 1: extract conservative visible facts from the image
-    console.log(`${LOG_PREFIX} OpenAI visible-facts request started`, {
-      model,
-      purpose,
-      detail: fullAnalysisDetail,
-    });
-    const factsCompletion = await openai.chat.completions.create({
-      model,
-      messages: [
-        { role: "system", content: VISIBLE_FACTS_SYSTEM_PROMPT },
-        {
-          role: "user",
-          content: [
-            { type: "image_url", image_url: { url: imageUrl, detail: fullAnalysisDetail } },
-            { type: "text", text: VISIBLE_FACTS_USER_PROMPT },
-          ],
-        },
-      ],
-      response_format: { type: "json_object" },
-      max_tokens: 400,
-    });
+    let visibleFacts: VisibleFacts;
+    let visibleFactsFromFallback: boolean;
+    let strengths: string[];
+    let improvements: string[];
+    let suggestions: string[];
+    let analysisTips: string[];
+    let improvementSuggestions: string[];
 
-    const rawFacts = factsCompletion.choices[0]?.message?.content;
-    if (ANALYSIS_DEBUG_ENABLED) {
-      const choiceMeta = factsCompletion.choices[0];
-      console.log(`${LOG_PREFIX} visible-facts metadata`, {
-        runId,
-        finish_reason: choiceMeta?.finish_reason,
-        usage: factsCompletion.usage,
-      });
-    }
-    let visibleFacts: VisibleFacts = { ...DEFAULT_VISIBLE_FACTS };
-    let visibleFactsFromFallback = false;
-    if (typeof rawFacts === "string") {
-      const preview = rawFacts.length > 600 ? `${rawFacts.slice(0, 600)}…` : rawFacts;
-      console.log(`${LOG_PREFIX} visible-facts raw content`, {
-        runId,
-        length: rawFacts.length,
-        preview,
-      });
-      const { parsed, usedRepair, errorMessage } = tryParseVisibleFactsFromString(rawFacts, runId);
-      if (parsed) {
-        visibleFacts = parseVisibleFacts(parsed);
-        console.log(`${LOG_PREFIX} visible-facts parsed successfully`, {
-          runId,
-          usedRepair,
-        });
-      } else {
-        visibleFactsFromFallback = true;
-        console.log(`${LOG_PREFIX} visible-facts parsing failed after repair, using degraded fallback`, {
-          runId,
-          errorMessage,
-        });
-        visibleFacts = { ...DEFAULT_VISIBLE_FACTS, outfit_visibility_quality: "parse_failed" };
-      }
+    if (parsedCombined) {
+      visibleFacts = parsedCombined.visibleFacts;
+      visibleFactsFromFallback = parsedCombined.visibleFactsFromFallback;
+      strengths = parsedCombined.strengths;
+      improvements = parsedCombined.improvements;
+      suggestions = parsedCombined.suggestions;
+      analysisTips = parsedCombined.analysisTips;
+      improvementSuggestions = parsedCombined.improvementSuggestions;
     } else {
-      visibleFactsFromFallback = true;
-      console.log(`${LOG_PREFIX} visible-facts response missing or non-string, using degraded fallback`, {
-        runId,
-        contentType: typeof rawFacts,
-      });
       visibleFacts = { ...DEFAULT_VISIBLE_FACTS, outfit_visibility_quality: "parse_failed" };
+      visibleFactsFromFallback = true;
+      strengths = [];
+      improvements = [];
+      suggestions = [];
+      analysisTips = [];
+      improvementSuggestions = [];
     }
 
-    // Derive structured subscores and overall score from visible facts (fact-driven scoring).
+    if (!visibleFacts.person_visible) {
+      const totalRequestMs = Date.now() - t0;
+      console.log(`${LOG_PREFIX} guardrail check: no person visible`, { purpose });
+      console.log(`${LOG_PREFIX} phase total_request_ms`, { totalRequestMs });
+      console.log(`${LOG_PREFIX} summary`, {
+        total_request_ms: totalRequestMs,
+        cache: "none",
+        visible_facts_fallback: visibleFactsFromFallback,
+        path: "invalid_no_person",
+      });
+      if (debugInfo) {
+        debugInfo.phase1Rejected = true;
+        debugInfo.phase1Reason = "no_person_detected";
+        logDebugSnapshot("person_not_visible_rejected", debugInfo);
+      }
+      return buildInvalidValidationResponse("no_person_detected");
+    }
+
     const derivedSubscores = visibleFactsFromFallback
       ? subscoresFromScore(6.5)
       : deriveSubscoresFromFacts(visibleFacts, purpose);
     const derivedScore = overallFromSubscores(derivedSubscores);
-    const analysisContext = {
-      purpose,
-      visibleFacts,
-      subscores: derivedSubscores,
-      score: derivedScore,
-    };
-    const qualityBucket =
-      derivedScore < 6.3 ? "weak" : derivedScore < 7.0 ? "neutral" : derivedScore < 7.7 ? "strong" : "excellent";
     console.log(`${LOG_PREFIX} derived scores from visible facts`, {
       purpose,
       subscores: derivedSubscores,
       score: derivedScore,
-      qualityBucket,
     });
-    if (ANALYSIS_DEBUG_ENABLED) {
-      console.log(`${LOG_PREFIX} key accessory facts`, {
-        belt_visible: visibleFacts.belt_visible,
-        bracelets_visible: visibleFacts.bracelets_visible,
-        watch_visible: visibleFacts.watch_visible,
-        necklace_visible: visibleFacts.necklace_visible,
-        ring_visible: visibleFacts.ring_visible,
-        top_tucked: visibleFacts.top_tucked,
-        shoe_visible: visibleFacts.shoe_visible,
-        ear_visibility: visibleFacts.ear_visibility,
-      });
-    }
 
     if (debugInfo) {
       debugInfo.visibleFactsSummary = {
@@ -1811,186 +1505,97 @@ export async function analyzePhotoWithAI(
       debugInfo.visibleFactsFromFallback = visibleFactsFromFallback;
     }
 
-    // Check for near-duplicate analyses based on visible facts (text reuse disabled).
     const allowNearDuplicateAnchor =
       !visibleFactsFromFallback &&
       (visibleFacts.outfit_visibility_quality ?? "").toLowerCase() !== "parse_failed";
-    console.log(`${LOG_PREFIX} near-duplicate cache check`, {
-      purpose,
-      runId,
-      allowNearDuplicateAnchor,
-      outfit_visibility_quality: visibleFacts.outfit_visibility_quality,
-      fromFallback: visibleFactsFromFallback,
-    });
-
-    let bestMatch: { entry: CachedAnalysisEntry; similarity: number } | null = null;
     if (allowNearDuplicateAnchor) {
-      bestMatch = findBestCachedMatch(purpose, visibleFacts);
-      if (bestMatch) {
-        console.log(`${LOG_PREFIX} cache anchor candidate: near-duplicate facts match (text NOT reused)`, {
-          purpose,
-          similarity: bestMatch.similarity,
-          runId,
-        });
+      const bestMatch = findBestCachedMatch(purpose, visibleFacts);
+      if (bestMatch && bestMatch.similarity >= 0.95) {
+        bestMatch.entry.lastUsedAt = Date.now();
         if (debugInfo) {
           debugInfo.cacheHitType = "near_duplicate";
           debugInfo.cacheAnchorSimilarity = bestMatch.similarity;
         }
+        console.log(`${LOG_PREFIX} near-duplicate cache hit (bypassed for testing)`, {
+          purpose,
+          similarity: bestMatch.similarity,
+        });
+        console.log(`${LOG_PREFIX} cache bypassed for testing`, { kind: "near_duplicate" });
       }
-    } else {
-      console.log(`${LOG_PREFIX} skipping near-duplicate cache anchoring due to fallback/low-confidence facts`, {
-        purpose,
-        runId,
-      });
     }
 
-    // Stage 2: grounded style analysis based ONLY on extracted facts and derived scores
-    console.log(`${LOG_PREFIX} OpenAI grounded analysis request started`, {
-      model,
-      purpose,
-      max_tokens: fullAnalysisMaxTokens,
+    const strengthsSanitized = sanitizeFeedbackItems(strengths);
+    const improvementsSanitized = sanitizeFeedbackItems(improvements);
+    const suggestionsSanitized = sanitizeFeedbackItems(suggestions);
+    let strengthsFiltered = strengthsSanitized.filter((s) => !isGeneric(s, { section: "strengths", runId: debugInfo?.fingerprint }));
+    let improvementsFiltered = improvementsSanitized.filter((s) => !isGeneric(s, { section: "improvements", runId: debugInfo?.fingerprint }));
+    let suggestionsFiltered = suggestionsSanitized.filter((s) => !isGeneric(s, { section: "suggestions", runId: debugInfo?.fingerprint }));
+    suggestionsFiltered = dropCrossSectionDuplicates(suggestionsFiltered, improvementsFiltered);
+    const analysisTipsSanitized = sanitizeFeedbackItems(analysisTips);
+    let improvementSuggestionsSanitized = sanitizeFeedbackItems(improvementSuggestions).slice(0, 5);
+
+    // HARD filter: never allow photo/scene critique phrases in outfit feedback sections.
+    strengthsFiltered = strengthsFiltered.filter((s) => !isPhotoCritiqueFeedback(s));
+    improvementsFiltered = improvementsFiltered.filter((s) => !isPhotoCritiqueFeedback(s));
+    suggestionsFiltered = suggestionsFiltered.filter((s) => !isPhotoCritiqueFeedback(s));
+    improvementSuggestionsSanitized = improvementSuggestionsSanitized.filter((s) => !isPhotoCritiqueFeedback(s));
+
+    // When outfit is clearly visible, additionally strip background/framing/lighting-focused feedback from all sections.
+    strengthsFiltered = dropBackgroundFocusedWhenVisible(strengthsFiltered, visibleFacts);
+    improvementsFiltered = dropBackgroundFocusedWhenVisible(improvementsFiltered, visibleFacts);
+    suggestionsFiltered = dropBackgroundFocusedWhenVisible(suggestionsFiltered, visibleFacts);
+    improvementSuggestionsSanitized = dropBackgroundFocusedWhenVisible(improvementSuggestionsSanitized, visibleFacts);
+
+    // Visibility comments are only appropriate when the outfit is genuinely hard to judge, and belong in analysisTips.
+    const analysisTipsVisibilityFiltered = analysisTipsSanitized.filter((s) => {
+      if (!isPhotoCritiqueFeedback(s)) return true;
+      return isOutfitVisibilityPoor(visibleFacts);
     });
-    const systemPrompt = getFullAnalysisSystemPrompt(purpose);
-    const userText =
-      purpose === "improve_fit"
-        ? "You are given structured visible facts about the outfit (no direct access to the image). Using ONLY these facts, output up to 3 specific, actionable outfit improvement suggestions. Do not contradict the facts, do not infer hidden details, and do not recommend actions that are already present in the facts. Focus on fit, color balance, layering, and visible accessories. Do not mention lighting, framing, or camera. Output only valid JSON."
-        : "You are given structured visible facts about the outfit and PRECOMPUTED numeric subscores and overall score (no direct access to the image). Using ONLY this structured context, explain the score, list strengths, and list grounded improvements and suggestions. Do not contradict the facts, do not infer hidden details, and do not recommend actions that are already present in the facts. Do NOT change or rescore the numeric values. No generic praise, no repeated points across sections. Output only valid JSON.";
+    const analysisTipsFinal = isOutfitVisibilityPoor(visibleFacts) ? analysisTipsVisibilityFiltered : [];
 
-    const groundedCompletion = await openai.chat.completions.create({
-      model,
-      messages: [
-        { role: "system", content: systemPrompt },
-        {
-          role: "user",
-          content: [
-            {
-              type: "text",
-              text:
-                "Here is the structured analysis context as JSON, including visible facts and PRECOMPUTED numeric subscores and overall score. Base your entire analysis ONLY on this context. Do not contradict the facts and do NOT change the numbers:\n" +
-                JSON.stringify(analysisContext),
-            },
-            { type: "text", text: userText },
-          ],
-        },
-      ],
-      response_format: { type: "json_object" },
-      max_tokens: fullAnalysisMaxTokens,
-    });
-
-    const raw = groundedCompletion.choices[0]?.message?.content;
-    console.log(`${LOG_PREFIX} OpenAI analysis response received`, {
-      contentExists: raw != null && typeof raw === "string",
-      contentLength: typeof raw === "string" ? raw.length : 0,
-    });
-
-    if (!raw || typeof raw !== "string") {
-      console.log(`${LOG_PREFIX} structured parsing failed: empty or non-string content`);
-      throw new InvalidAIResponseError("Empty or non-string AI response");
-    }
-
-    console.log(`${LOG_PREFIX} structured parsing started`);
-    let parsed: Record<string, unknown>;
-    try {
-      parsed = JSON.parse(raw) as Record<string, unknown>;
-    } catch (parseErr) {
-      console.log(`${LOG_PREFIX} structured parsing failed: JSON parse error`);
-      throw new InvalidAIResponseError("Invalid JSON in AI response");
-    }
-
-    const result = parseFullResponse(parsed, debugInfo);
-    if (result === null) {
-      console.log(`${LOG_PREFIX} structured parsing failed: invalid response shape`);
-      throw new InvalidAIResponseError("Invalid analysis response shape");
-    }
-
-    console.log(`${LOG_PREFIX} structured parsing succeeded`);
-
-    if (!result.isValid) {
-      // For improve_fit, the photo already passed analysis; avoid showing "suitable for analysis" again.
-      if (purpose === "improve_fit") {
-        console.log(`${LOG_PREFIX} improve_fit full analysis returned invalid; returning outfit-oriented fallback suggestions`);
-        const fallbackSuggestions = [
-          "Consider how the top and bottom pieces relate in proportion for a stronger silhouette.",
-          "Pay attention to how visible colors work together across the outfit.",
-          "If you add any extra layer or accessory, make sure it clearly supports the existing look instead of repeating what is already there.",
-        ];
-        const fallback: AnalysisResponse = {
-          isValid: true,
-          validationMessage: null,
-          reason: null,
-          score: 7,
-          subscores: subscoresFromScore(7),
-          strengths: ["Outfit was previously evaluated successfully"],
-          improvements: [],
-          suggestions: fallbackSuggestions,
-          analysisTips: [],
-          improvementSuggestions: fallbackSuggestions,
-        };
-        if (debugInfo) {
-          debugInfo.fallbackMockUsed = true;
-          debugInfo.finalStrengths = fallback.strengths;
-          debugInfo.finalImprovements = fallback.improvements;
-          debugInfo.finalSuggestions = fallback.suggestions;
-          debugInfo.finalAnalysisTips = fallback.analysisTips;
-          debugInfo.finalScore = fallback.score;
-          logDebugSnapshot("improve_fit_invalid_fallback", debugInfo);
-        }
-        return fallback;
-      }
-      console.log(`${LOG_PREFIX} guardrail check (phase 2): rejected`, { reason: result.reason, purpose });
-      if (debugInfo) {
-        debugInfo.phase2ValidatorRejected = true;
-        debugInfo.phase2ValidatorReason = result.reason ?? null;
-        debugInfo.finalStrengths = result.strengths;
-        debugInfo.finalImprovements = result.improvements;
-        debugInfo.finalSuggestions = result.suggestions;
-        debugInfo.finalAnalysisTips = result.analysisTips;
-        debugInfo.finalScore = result.score;
-        logDebugSnapshot("phase2_invalid_return", debugInfo);
-      }
-      return result;
-    }
-
-    // Override any AI-provided numeric scores with fact-driven subscores and overall score.
-    // Always use freshly generated text from this run; do NOT reuse cached text from near-duplicates.
     const factDrivenResult: AnalysisResponse = {
-      ...result,
-      subscores: derivedSubscores,
+      isValid: true,
+      validationMessage: null,
+      reason: null,
       score: derivedScore,
+      subscores: derivedSubscores,
       scoreExplanation: deriveScoreExplanation(derivedSubscores),
+      strengths: strengthsFiltered,
+      improvements: improvementsFiltered.length > 0 ? improvementsFiltered : [],
+      suggestions: suggestionsFiltered,
+      analysisTips: analysisTipsFinal,
+      improvementSuggestions: improvementSuggestionsSanitized.length > 0 ? improvementSuggestionsSanitized : undefined,
     };
 
-    // Stage 3: deterministic contradiction cleanup based on extracted facts
     const sanitized = sanitizeContradictorySuggestions(visibleFacts, factDrivenResult);
-
-    // Store in cache for future exact / near-duplicate analyses.
-    putCachedAnalysis(fingerprint, purpose, visibleFacts, sanitized);
+    const completeSanitized = ensureCompleteResponse(sanitized);
+    putCachedAnalysis(fingerprint, purpose, visibleFacts, completeSanitized);
 
     if (debugInfo) {
-      debugInfo.finalStrengths = sanitized.strengths;
-      debugInfo.finalImprovements = sanitized.improvements;
-      debugInfo.finalSuggestions = sanitized.suggestions;
-      debugInfo.finalAnalysisTips = sanitized.analysisTips;
-      debugInfo.finalScore = sanitized.score;
+      debugInfo.finalStrengths = completeSanitized.strengths;
+      debugInfo.finalImprovements = completeSanitized.improvements;
+      debugInfo.finalSuggestions = completeSanitized.suggestions;
+      debugInfo.finalAnalysisTips = completeSanitized.analysisTips;
+      debugInfo.finalScore = completeSanitized.score;
       logDebugSnapshot("final_sanitized_output", debugInfo);
     }
 
-    let finalResponse: AnalysisResponse = sanitized;
+    let finalResponse: AnalysisResponse = completeSanitized;
     if (ANALYSIS_DEBUG_ENABLED && debugInfo) {
-      const debugExport: AnalysisDebug = {
-        visibleFactsSummary: debugInfo.visibleFactsSummary ?? null,
-        evaluability: debugInfo.evaluability ?? null,
-        visibleFactsFromFallback: debugInfo.visibleFactsFromFallback ?? false,
-        strengthsCount: sanitized.strengths.length,
-        improvementsCount: sanitized.improvements.length,
-        suggestionsCount: sanitized.suggestions.length,
-      };
       finalResponse = {
-        ...sanitized,
-        debug: debugExport,
+        ...completeSanitized,
+        debug: {
+          visibleFactsSummary: debugInfo.visibleFactsSummary ?? null,
+          evaluability: debugInfo.evaluability ?? null,
+          visibleFactsFromFallback: debugInfo.visibleFactsFromFallback ?? false,
+          strengthsCount: completeSanitized.strengths.length,
+          improvementsCount: completeSanitized.improvements.length,
+          suggestionsCount: completeSanitized.suggestions.length,
+        },
       };
     }
 
+    const totalRequestMs = Date.now() - t0;
     console.log(`${LOG_PREFIX} final score summary`, {
       purpose,
       subscores: finalResponse.subscores,
@@ -1999,6 +1604,13 @@ export async function analyzePhotoWithAI(
       cacheHitType: debugInfo?.cacheHitType ?? "none",
     });
     console.log(`${LOG_PREFIX} analysis complete`, { purpose, score: finalResponse.score });
+    console.log(`${LOG_PREFIX} phase total_request_ms`, { totalRequestMs });
+    console.log(`${LOG_PREFIX} summary`, {
+      total_request_ms: totalRequestMs,
+      cache: "none",
+      visible_facts_fallback: visibleFactsFromFallback,
+      path: "success",
+    });
     return finalResponse;
   } catch (err) {
     if (err instanceof InvalidAIResponseError) {

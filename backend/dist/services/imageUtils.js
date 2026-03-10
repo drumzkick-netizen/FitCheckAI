@@ -1,12 +1,15 @@
 "use strict";
 /**
  * Resize and compress image for vision API to reduce payload size and token cost.
+ * Tuned for speed and reliability: smaller payloads and lower token cost without hurting analysis.
  * Uses sharp when available; returns original base64 on failure or if sharp is missing.
  */
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.resizeAndCompressImage = resizeAndCompressImage;
-const MAX_DIMENSION = 1024;
-const JPEG_QUALITY = 82;
+/** Max dimension for faster upload and lower vision token cost; sufficient for outfit analysis. */
+const MAX_DIMENSION = 640;
+/** Compression for speed; keeps images readable for the model. */
+const JPEG_QUALITY = 68;
 function getBase64Data(imageBase64) {
     const trimmed = imageBase64.trim();
     const dataUrlPrefix = "data:";

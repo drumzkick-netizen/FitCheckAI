@@ -8,6 +8,7 @@ const VALID_PURPOSES = [
     "social",
     "professional",
     "compare",
+    "improve_fit",
 ];
 function isPhotoPurpose(value) {
     return typeof value === "string" && VALID_PURPOSES.includes(value);

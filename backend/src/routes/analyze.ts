@@ -33,6 +33,7 @@ export async function analyzePhoto(req: Request, res: Response): Promise<void> {
   const headerRunId = req.header("X-Fitcheck-Run-Id");
   const runId = headerRunId && headerRunId.trim().length > 0 ? headerRunId : crypto.randomUUID();
 
+  const routeStartMs = Date.now();
   console.log(`${LOG_PREFIX} request received`, { runId, purpose, imagePayloadLength });
 
   console.log(`${LOG_PREFIX} image validation started`);
@@ -60,12 +61,14 @@ export async function analyzePhoto(req: Request, res: Response): Promise<void> {
   try {
     const analysis = await analyzePhotoWithAI(imageBase64, purpose);
 
+    const totalRouteMs = Date.now() - routeStartMs;
     console.log(`${LOG_PREFIX} final response sent: success`, {
       runId,
       score: analysis.score,
       strengthsCount: analysis.strengths.length,
       improvementsCount: analysis.improvements.length,
       suggestionsCount: analysis.suggestions.length,
+      total_route_ms: totalRouteMs,
     });
     res.status(200).json(analysis);
   } catch (err) {
