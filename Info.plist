@@ -1,12 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<key>NSCameraUsageDescription</key>
-	<string>FitCheckAI uses the camera so you can take a photo to analyze.</string>
-	<key>NSPhotoLibraryUsageDescription</key>
-	<string>FitCheckAI uses your photo library so you can upload outfits for analysis.</string>
-	<key>NSLocalNetworkUsageDescription</key>
-	<string>Allow FitCheckAI to connect to your local development server.</string>
 	<key>DevBackendHost</key>
 	<string>192.168.40.76</string>
 	<key>NSAppTransportSecurity</key>
