@@ -45,7 +45,9 @@ private var heroButtonGradient: LinearGradient {
 struct HomeView: View {
     @EnvironmentObject private var flowViewModel: AppFlowViewModel
     @EnvironmentObject private var historyViewModel: HistoryViewModel
+    @EnvironmentObject private var subscriptionManager: SubscriptionManager
     @State private var presentedBattle: PhotoBattleResult?
+    @State private var showPaywall: Bool = false
 
     /// Merged recent records (single analyses + battles) sorted by date, newest first.
     private var recentRecords: [HistoryRecord] {
@@ -73,6 +75,10 @@ struct HomeView: View {
         .navigationTitle("")
         .navigationBarTitleDisplayMode(.inline)
         .preferredColorScheme(.dark)
+        .sheet(isPresented: $showPaywall) {
+            PaywallView()
+                .environmentObject(subscriptionManager)
+        }
         .sheet(item: $presentedBattle) { battle in
             NavigationStack {
                 BattleHistoryDetailView(battle: battle)
@@ -121,10 +127,14 @@ struct HomeView: View {
             }
             HStack(spacing: HomeLayout.heroButtonSpacing) {
                 Button {
-                    flowViewModel.clearSinglePhotoFlowState()
-                    flowViewModel.selectedPurpose = nil
-                    flowViewModel.preferCameraOnNextCapture = true
-                    flowViewModel.navigationPath.append(.capture)
+                    if subscriptionManager.canAnalyze {
+                        flowViewModel.clearSinglePhotoFlowState()
+                        flowViewModel.selectedPurpose = nil
+                        flowViewModel.preferCameraOnNextCapture = true
+                        flowViewModel.navigationPath.append(.capture)
+                    } else {
+                        showPaywall = true
+                    }
                 } label: {
                     Label("Take Photo", systemImage: "camera.fill")
                         .font(.subheadline)
@@ -139,10 +149,14 @@ struct HomeView: View {
                 .buttonStyle(PressableButtonStyle())
 
                 Button {
-                    flowViewModel.clearSinglePhotoFlowState()
-                    flowViewModel.selectedPurpose = nil
-                    flowViewModel.preferLibraryOnNextCapture = true
-                    flowViewModel.navigationPath.append(.capture)
+                    if subscriptionManager.canAnalyze {
+                        flowViewModel.clearSinglePhotoFlowState()
+                        flowViewModel.selectedPurpose = nil
+                        flowViewModel.preferLibraryOnNextCapture = true
+                        flowViewModel.navigationPath.append(.capture)
+                    } else {
+                        showPaywall = true
+                    }
                 } label: {
                     Label("Upload Photo", systemImage: "photo.on.rectangle.angled")
                         .font(.subheadline)
@@ -208,9 +222,13 @@ struct HomeView: View {
     // MARK: - Daily Fit Challenge (compact engagement hook; does not compete with hero)
     private var dailyChallengeSection: some View {
         Button {
-            flowViewModel.clearSinglePhotoFlowState()
-            flowViewModel.selectedPurpose = nil
-            flowViewModel.navigationPath.append(.capture)
+            if subscriptionManager.canAnalyze {
+                flowViewModel.clearSinglePhotoFlowState()
+                flowViewModel.selectedPurpose = nil
+                flowViewModel.navigationPath.append(.capture)
+            } else {
+                showPaywall = true
+            }
         } label: {
             HStack(spacing: 10) {
                 Image(systemName: hasCompletedChallengeToday ? "checkmark.circle.fill" : "sparkles")

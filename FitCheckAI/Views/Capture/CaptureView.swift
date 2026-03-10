@@ -3,7 +3,6 @@
 //  FitCheckAI
 //
 
-import AVFoundation
 import PhotosUI
 import SwiftUI
 import UIKit
@@ -17,7 +16,7 @@ struct CaptureView: View {
     @State private var showLibraryPicker = false
 
     private var isCameraAvailable: Bool {
-        AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) != nil
+        CameraAvailability.isAvailable
     }
 
     var body: some View {
@@ -35,8 +34,9 @@ struct CaptureView: View {
                 Spacer(minLength: 24)
                 continueButton
             }
-            .padding()
-            .padding(.bottom, 32)
+            .appScreenContent()
+            .padding(.top, 20)
+            .padding(.bottom, 48)
         }
         .background(AmbientGlowBackground())
         .navigationTitle("Select Photo")
@@ -113,6 +113,7 @@ struct CaptureView: View {
                 .glassCard(padding: 16, cornerRadius: 20)
             }
             .buttonStyle(CardTapButtonStyle())
+            .disabled(!isCameraAvailable)
 
             if !isCameraAvailable {
                 Text("Camera is not available on this device.")
@@ -156,9 +157,17 @@ struct CaptureView: View {
         .opacity(flowViewModel.selectedImage == nil ? 0.6 : 1)
     }
 
-    private func applyCameraImage(_ image: UIImage) {
-        flowViewModel.selectedImage = image
-        flowViewModel.selectedImageData = image.jpegData(compressionQuality: jpegCompressionQuality)
+    /// Single pipeline for both camera and library: normalize orientation, then set selectedImage and selectedImageData so analysis works.
+    private func applySelectedImage(_ image: UIImage) {
+        let normalized = image.normalizedForDisplayAndUpload()
+        guard let jpegData = normalized.jpegData(compressionQuality: jpegCompressionQuality) else {
+            flowViewModel.selectedImage = normalized
+            flowViewModel.selectedImageData = nil
+            return
+        }
+        let preparedData = ImageUploadPreparer.prepareForAnalysis(imageData: jpegData)
+        flowViewModel.selectedImageData = preparedData
+        flowViewModel.selectedImage = UIImage(data: preparedData)
     }
 
     private func loadImage(from item: PhotosPickerItem?) async {
@@ -167,13 +176,13 @@ struct CaptureView: View {
             flowViewModel.selectedImageData = nil
             return
         }
-        guard let data = try? await item.loadTransferable(type: Data.self) else {
+        guard let data = try? await item.loadTransferable(type: Data.self),
+              let image = UIImage(data: data) else {
             flowViewModel.selectedImage = nil
             flowViewModel.selectedImageData = nil
             return
         }
-        flowViewModel.selectedImageData = data
-        flowViewModel.selectedImage = UIImage(data: data)
+        applySelectedImage(image)
     }
 }
 
@@ -218,9 +227,18 @@ private struct LibraryPickerSheetView: View {
             .onChange(of: selectedItem) { _, newItem in
                 Task {
                     guard let newItem else { return }
-                    guard let data = try? await newItem.loadTransferable(type: Data.self) else { return }
-                    flowViewModel.selectedImageData = data
-                    flowViewModel.selectedImage = UIImage(data: data)
+                    guard let data = try? await newItem.loadTransferable(type: Data.self),
+                          let image = UIImage(data: data) else { return }
+                    let normalized = image.normalizedForDisplayAndUpload()
+                    guard let jpegData = normalized.jpegData(compressionQuality: jpegQuality) else {
+                        flowViewModel.selectedImage = normalized
+                        flowViewModel.selectedImageData = nil
+                        await MainActor.run { onDismiss() }
+                        return
+                    }
+                    let preparedData = ImageUploadPreparer.prepareForAnalysis(imageData: jpegData)
+                    flowViewModel.selectedImageData = preparedData
+                    flowViewModel.selectedImage = UIImage(data: preparedData)
                     await MainActor.run { onDismiss() }
                 }
             }

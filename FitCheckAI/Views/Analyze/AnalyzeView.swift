@@ -11,6 +11,7 @@ private let completionDelayBeforeNavigate: Double = 0.6
 struct AnalyzeView: View {
     @EnvironmentObject private var flowViewModel: AppFlowViewModel
     @EnvironmentObject private var historyViewModel: HistoryViewModel
+    @EnvironmentObject private var subscriptionManager: SubscriptionManager
     @StateObject private var viewModel: AnalyzeViewModel
     @State private var hasStartedAnalysis = false
     @State private var hasScheduledCompletionNavigation = false
@@ -56,7 +57,9 @@ struct AnalyzeView: View {
             }
         }
         .onAppear {
-            print("🔥🔥🔥 AnalyzeView onAppear — Analyze screen appeared, will tryAutoStartAnalysis if not invalid")
+            #if DEBUG
+            print("AnalyzeView onAppear — will tryAutoStartAnalysis if not invalid")
+            #endif
             if !isInvalidPhotoState {
                 tryAutoStartAnalysis()
             }
@@ -144,7 +147,7 @@ struct AnalyzeView: View {
     private var headerSection: some View {
         Group {
             if showLoadingState {
-                Text("Analyzing your fit...")
+                Text(viewModel.statusLine ?? "Analyzing your fit...")
                     .font(.title2)
                     .fontWeight(.semibold)
                     .foregroundStyle(.white)
@@ -230,7 +233,9 @@ struct AnalyzeView: View {
                     .font(.subheadline)
                     .foregroundStyle(AppColors.mutedText)
                 Button("Try Again") {
-                    print("🔥🔥🔥 AnalyzeView Try Again button tapped — calling runAnalysis")
+                    #if DEBUG
+                    print("AnalyzeView Try Again button tapped — calling runAnalysis")
+                    #endif
                     viewModel.errorMessage = nil
                     runAnalysis()
                 }
@@ -301,6 +306,7 @@ struct AnalyzeView: View {
               viewModel.errorMessage == nil,
               viewModel.validationErrorMessage == nil,
               !hasStartedAnalysis else { return }
+        print("Analyze tapped (auto-start on appear)")
         print("🔥🔥🔥 AnalyzeView tryAutoStartAnalysis — auto-starting analysis (onAppear path)")
         hasStartedAnalysis = true
         runAnalysis()
@@ -309,12 +315,12 @@ struct AnalyzeView: View {
     private func runAnalysis() {
         guard let imageData = flowViewModel.selectedImageData,
               let purpose = flowViewModel.selectedPurpose else { return }
+        print("Analyze tapped — starting analysis")
         AnalyticsService.log(.analysisStarted)
-        print("🔥🔥🔥 AnalyzeView runAnalysis — button/trigger path, calling viewModel.analyze")
         analysisStartTime = Date()
         minDisplaySatisfied = false
         hasScheduledCompletionNavigation = false
-        Task {
+        Task { @MainActor in
             await viewModel.analyze(imageData: imageData, purpose: purpose)
         }
     }
@@ -324,6 +330,10 @@ struct AnalyzeView: View {
         guard let result = viewModel.result,
               let imageData = flowViewModel.selectedImageData,
               let purpose = flowViewModel.selectedPurpose else { return }
+        subscriptionManager.recordAnalysisUsedIfNeeded()
+        #if DEBUG
+        print("Navigation to results triggered")
+        #endif
         AnalyticsService.log(.analysisCompleted)
         flowViewModel.latestResult = result
         historyViewModel.addAnalysis(imageData: imageData, purpose: purpose, result: result)

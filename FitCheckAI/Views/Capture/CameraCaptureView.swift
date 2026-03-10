@@ -18,8 +18,14 @@ final class CameraSessionController: NSObject, ObservableObject {
     private let photoOutput = AVCapturePhotoOutput()
     private var captureCompletion: ((UIImage?) -> Void)?
     private var isFront = false
-    /// Used so Swift recognizes ObservableObject conformance when subclassing NSObject.
+    private var captureDevice: AVCaptureDevice?
+
     @Published private(set) var sessionRunning = false
+    @Published private(set) var currentZoomFactor: CGFloat = 1.0
+
+    var minZoomFactor: CGFloat { captureDevice?.minAvailableVideoZoomFactor ?? 1.0 }
+    var maxZoomFactor: CGFloat { captureDevice?.maxAvailableVideoZoomFactor ?? 1.0 }
+    var canZoom: Bool { (captureDevice?.maxAvailableVideoZoomFactor ?? 1.0) > 1.0 }
 
     override init() {
         super.init()
@@ -33,6 +39,8 @@ final class CameraSessionController: NSObject, ObservableObject {
               let input = try? AVCaptureDeviceInput(device: device) else { return }
         if session.canAddInput(input) {
             session.addInput(input)
+            captureDevice = device
+            currentZoomFactor = 1.0
         }
         if session.canAddOutput(photoOutput) {
             session.addOutput(photoOutput)
@@ -52,7 +60,37 @@ final class CameraSessionController: NSObject, ObservableObject {
         }
         if session.canAddInput(newInput) {
             session.addInput(newInput)
+            captureDevice = device
+            resetZoom()
         }
+    }
+
+    func setZoomFactor(_ factor: CGFloat) {
+        guard let device = captureDevice else { return }
+        if #available(iOS 15.0, *) {
+            guard !device.isRampingVideoZoom else { return }
+        }
+        let clamped = min(max(factor, minZoomFactor), maxZoomFactor)
+        do {
+            try device.lockForConfiguration()
+            device.videoZoomFactor = clamped
+            DispatchQueue.main.async { [weak self] in
+                self?.currentZoomFactor = clamped
+            }
+            device.unlockForConfiguration()
+        } catch {}
+    }
+
+    func resetZoom() {
+        guard let device = captureDevice else { return }
+        do {
+            try device.lockForConfiguration()
+            device.videoZoomFactor = 1.0
+            DispatchQueue.main.async { [weak self] in
+                self?.currentZoomFactor = 1.0
+            }
+            device.unlockForConfiguration()
+        } catch {}
     }
 
     func startSession() {
@@ -126,6 +164,8 @@ struct CameraCaptureView: View {
     @StateObject private var cameraSession = CameraSessionController()
     @State private var isCapturing = false
     @State private var showLibrary = false
+    @State private var gestureStartZoom: CGFloat = 1.0
+    @State private var isPinching = false
 
     private var contextTip: String? {
         guard let purpose = flowViewModel.selectedPurpose else { return nil }
@@ -152,10 +192,12 @@ struct CameraCaptureView: View {
         .navigationBarTitleDisplayMode(.inline)
         .preferredColorScheme(.dark)
         .onAppear {
+            CameraOrientationLock.lockPortrait = true
             cameraSession.configure()
             cameraSession.startSession()
         }
         .onDisappear {
+            CameraOrientationLock.lockPortrait = false
             cameraSession.stopSession()
         }
         .sheet(isPresented: $showLibrary) {
@@ -196,6 +238,22 @@ struct CameraCaptureView: View {
         }
         .aspectRatio(3/4, contentMode: .fit)
         .padding(.horizontal, 4)
+        .contentShape(Rectangle())
+        .gesture(
+            MagnificationGesture()
+                .onChanged { value in
+                    if !isPinching {
+                        gestureStartZoom = cameraSession.currentZoomFactor
+                        isPinching = true
+                    }
+                    let newZoom = gestureStartZoom * value
+                    cameraSession.setZoomFactor(newZoom)
+                }
+                .onEnded { _ in
+                    isPinching = false
+                    gestureStartZoom = cameraSession.currentZoomFactor
+                }
+        )
     }
 
     private var controlsSection: some View {
@@ -231,6 +289,24 @@ struct CameraCaptureView: View {
                 }
             }
             .padding(.horizontal, 32)
+
+            if cameraSession.canZoom {
+                HStack(spacing: 16) {
+                    Button("1×") {
+                        cameraSession.setZoomFactor(1.0)
+                    }
+                    .font(.subheadline)
+                    .fontWeight(cameraSession.currentZoomFactor <= 1.05 ? .semibold : .regular)
+                    .foregroundStyle(cameraSession.currentZoomFactor <= 1.05 ? AppColors.accent : AppColors.mutedText)
+
+                    Button("2×") {
+                        cameraSession.setZoomFactor(min(2.0, cameraSession.maxZoomFactor))
+                    }
+                    .font(.subheadline)
+                    .fontWeight(cameraSession.currentZoomFactor >= 1.95 ? .semibold : .regular)
+                    .foregroundStyle(cameraSession.currentZoomFactor >= 1.95 ? AppColors.accent : AppColors.mutedText)
+                }
+            }
 
             Button {
                 takePhoto()
@@ -279,9 +355,10 @@ struct CameraCaptureView: View {
     }
 
     private func applyImage(_ image: UIImage) {
-        // Downsample and compress immediately to avoid keeping full-resolution images in memory.
-        guard let originalJPEG = image.jpegData(compressionQuality: jpegCompressionQuality) else {
-            flowViewModel.selectedImage = image
+        // Normalize orientation so camera photos display and encode correctly, then downsample/compress.
+        let normalized = image.normalizedForDisplayAndUpload()
+        guard let originalJPEG = normalized.jpegData(compressionQuality: jpegCompressionQuality) else {
+            flowViewModel.selectedImage = normalized
             flowViewModel.selectedImageData = nil
             return
         }

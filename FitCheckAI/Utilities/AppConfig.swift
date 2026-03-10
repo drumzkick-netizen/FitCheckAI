@@ -33,7 +33,7 @@ enum AppEnvironment: String, CaseIterable {
         case .development:
             return "https://api-dev.fitcheckai.com"
         case .production:
-            return "https://api.fitcheckai.com"
+            return "https://fitcheckai-as61.onrender.com"
         }
     }
 
@@ -50,15 +50,8 @@ enum AppConfig {
     /// Simulator base URL. Simulator and Mac share the same host, so 127.0.0.1 works.
     static let simulatorBackendBaseURL = "http://127.0.0.1:3000"
 
-    /// Environment selection: DEBUG builds default to .local for development,
-    /// RELEASE/TestFlight builds default to .production.
-    static var currentEnvironment: AppEnvironment = {
-        #if DEBUG
-        return .local
-        #else
-        return .production
-        #endif
-    }()
+    /// Environment selection: always use production backend.
+    static var currentEnvironment: AppEnvironment = .production
 
     /// For local env on a physical device: base URL using Mac's LAN IP from Info.plist key `DevBackendHost`.
     /// Set DevBackendHost to your Mac's IP (e.g. 192.168.1.100) so the device can reach the backend on the same Wi‑Fi.

@@ -46,7 +46,9 @@ final class APIPhotoAnalysisService: PhotoAnalysisServicing {
     init(session: URLSession = .shared) {
         self.analyzeURLString = AppConfig.analyzePhotoURL
         self.session = session
+        #if DEBUG
         print("[APIPhotoAnalysisService] Init — resolved analyze URL: \(analyzeURLString)")
+        #endif
     }
 
     func analyzePhoto(
@@ -54,7 +56,10 @@ final class APIPhotoAnalysisService: PhotoAnalysisServicing {
         purpose: PhotoPurpose
     ) async throws -> AnalysisOutcome {
         let runId = UUID().uuidString
-        print("🔥🔥🔥 APIPhotoAnalysisService analyzePhoto — service entry (runId=\(runId))")
+        #if DEBUG
+        print("Analysis request started (runId=\(runId))")
+        print("APIPhotoAnalysisService analyzePhoto — service entry (runId=\(runId))")
+        #endif
         guard let url = URL(string: analyzeURLString) else {
             print("[APIPhotoAnalysisService] Error: invalid URL")
             throw AnalysisServiceError.invalidURL
@@ -90,11 +95,13 @@ final class APIPhotoAnalysisService: PhotoAnalysisServicing {
         request.httpBody = bodyData
 
         let requestURL = request.url?.absoluteString ?? "nil"
+        #if DEBUG
         print("[APIPhotoAnalysisService] REQUEST (runId=\(runId)) — URL: \(requestURL)")
         print("[APIPhotoAnalysisService] REQUEST (runId=\(runId)) — method: \(request.httpMethod ?? "nil"), timeout: \(request.timeoutInterval)s")
         print("[APIPhotoAnalysisService] REQUEST (runId=\(runId)) — preparedImage bytes: \(preparedData.count), pixelSize: \(pixelSize), fingerprint: \(fingerprint)")
         print("[APIPhotoAnalysisService] REQUEST (runId=\(runId)) — payload size: \(bodyData.count) bytes, imageBase64 length: \(base64String.count), purpose: \(purpose.rawValue)")
         print("[APIPhotoAnalysisService] Connecting to: \(requestURL)")
+        #endif
 
         let (data, response): (Data, URLResponse)
         do {
@@ -106,32 +113,43 @@ final class APIPhotoAnalysisService: PhotoAnalysisServicing {
             let desc = error.localizedDescription
             let underlyingDesc = underlying?.localizedDescription ?? ""
 
+            #if DEBUG
             print("[APIPhotoAnalysisService] REQUEST FAILED (runId=\(runId)) — error: \(desc)")
             if let u = urlError {
                 print("[APIPhotoAnalysisService] REQUEST FAILED (runId=\(runId)) — URLError code: \(u.code.rawValue) (\(String(describing: u.code)))")
             }
             print("[APIPhotoAnalysisService] REQUEST FAILED (runId=\(runId)) — underlying: \(String(describing: underlying))")
+            #endif
 
             let isLocalNetworkBlocked = (urlError?.code.rawValue == -1009)
                 || desc.localizedCaseInsensitiveContains("Local network prohibited")
                 || underlyingDesc.localizedCaseInsensitiveContains("Local network prohibited")
             if isLocalNetworkBlocked {
+                #if DEBUG
                 print("[APIPhotoAnalysisService] REQUEST FAILED (runId=\(runId)) — Local network prohibited (code -1009). User must enable Local Network for FitCheckAI in Settings.")
+                #endif
                 throw AnalysisServiceError.localNetworkProhibited
             }
             if urlError?.code.rawValue == -1004 {
+                #if DEBUG
                 print("[APIPhotoAnalysisService] REQUEST FAILED (runId=\(runId)) — Could not connect to server (-1004). Is the backend running on port 3000?")
+                #endif
                 throw AnalysisServiceError.connectionFailed(customMessage: "Could not reach the local backend. Make sure your backend server is running on port 3000.")
             }
             throw AnalysisServiceError.connectionFailed(customMessage: nil)
         }
 
         guard let httpResponse = response as? HTTPURLResponse else {
+            #if DEBUG
             print("[APIPhotoAnalysisService] RESPONSE (runId=\(runId)) — invalid type (not HTTPURLResponse)")
+            #endif
             throw AnalysisServiceError.invalidResponse
         }
 
+        #if DEBUG
+        print("Response received (runId=\(runId)) — statusCode: \(httpResponse.statusCode), data length: \(data.count) bytes")
         print("[APIPhotoAnalysisService] RESPONSE (runId=\(runId)) — statusCode: \(httpResponse.statusCode), data length: \(data.count) bytes")
+        #endif
 
         guard (200...299).contains(httpResponse.statusCode) else {
             let bodyPreview = String(data: data, encoding: .utf8).map { $0.prefix(500) } ?? "nil"
@@ -141,17 +159,28 @@ final class APIPhotoAnalysisService: PhotoAnalysisServicing {
 
         let dto: AnalyzePhotoResponseDTO
         do {
+            #if DEBUG
+            print("Decoding started (runId=\(runId))")
+            #endif
             dto = try JSONDecoder().decode(AnalyzePhotoResponseDTO.self, from: data)
+            #if DEBUG
+            print("Decoding finished (runId=\(runId))")
+            #endif
         } catch {
             let bodyPreview = String(data: data, encoding: .utf8).map { String($0.prefix(500)) } ?? "nil"
+            #if DEBUG
+            print("Caught error (decode): \(error)")
             print("[APIPhotoAnalysisService] DECODE FAILED (runId=\(runId)) — \(error.localizedDescription), raw body: \(bodyPreview)")
+            #endif
             throw AnalysisServiceError.decodingFailed
         }
 
         if !dto.isValid {
             let trimmed = dto.validationMessage?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             let message = trimmed.isEmpty ? "This photo doesn't appear suitable for analysis." : trimmed
+            #if DEBUG
             print("[APIPhotoAnalysisService] Validation failed (runId=\(runId)): \(dto.reason ?? "unknown")")
+            #endif
             return .invalid(message: message)
         }
 
@@ -161,9 +190,13 @@ final class APIPhotoAnalysisService: PhotoAnalysisServicing {
             score = s
         } else if purpose == .improveFit, !(dto.improvementSuggestions ?? []).isEmpty {
             score = 7
+            #if DEBUG
             print("[APIPhotoAnalysisService] improve_fit (runId=\(runId)): valid response without score, using placeholder to show suggestions")
+            #endif
         } else {
+            #if DEBUG
             print("[APIPhotoAnalysisService] Error (runId=\(runId)): valid response but missing score")
+            #endif
             return .invalid(message: "We couldn't score this photo. Try another.")
         }
 
@@ -179,6 +212,11 @@ final class APIPhotoAnalysisService: PhotoAnalysisServicing {
         let explanationNilIfEmpty = explanation.map { $0.isEmpty ? nil : $0 } ?? nil
         let tips = (dto.analysisTips ?? []).filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
         let improveSuggestions = (dto.improvementSuggestions ?? []).filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        #if DEBUG
+        if purpose == .improveFit {
+            print("[APIPhotoAnalysisService] improve_fit payload (runId=\(runId)) — improvementSuggestions.count=\(improveSuggestions.count)")
+        }
+        #endif
 
         let debugInfo: AnalysisDebugInfo?
         if let debugDTO = dto.debug {
@@ -190,15 +228,20 @@ final class APIPhotoAnalysisService: PhotoAnalysisServicing {
                 improvementsCount: debugDTO.improvementsCount,
                 suggestionsCount: debugDTO.suggestionsCount
             )
+            #if DEBUG
             print("[APIPhotoAnalysisService] DEBUG (runId=\(runId)) — evaluability=\(debugDTO.evaluability ?? "nil"), fromFallback=\(debugDTO.visibleFactsFromFallback == true ? "true" : "false")")
+            #endif
         } else {
             debugInfo = nil
         }
 
+        #if DEBUG
+        print("Result set (runId=\(runId)) — score: \(score)")
         print("[APIPhotoAnalysisService] Decoding succeeded (runId=\(runId)) — score: \(score), strengths: \(dto.strengths.count), improvements: \(dto.improvements.count), suggestions: \(dto.suggestions.count)")
         print("[APIPhotoAnalysisService] FINAL (runId=\(runId)) — strengths: \(dto.strengths)")
         print("[APIPhotoAnalysisService] FINAL (runId=\(runId)) — improvements: \(dto.improvements)")
         print("[APIPhotoAnalysisService] FINAL (runId=\(runId)) — suggestions: \(dto.suggestions)")
+        #endif
         return .valid(AnalysisResult(
             score: score,
             subscores: subscores,

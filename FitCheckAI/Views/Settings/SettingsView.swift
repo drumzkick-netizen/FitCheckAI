@@ -4,11 +4,15 @@
 //
 
 import SwiftUI
+import StoreKit
 
 struct SettingsView: View {
     @EnvironmentObject private var historyViewModel: HistoryViewModel
+    @EnvironmentObject private var subscriptionManager: SubscriptionManager
+    @Environment(\.openURL) private var openURL
     @State private var showClearConfirmation = false
     @State private var showCleared = false
+    @State private var showPaywall = false
     #if DEBUG
     @AppStorage("fitcheck_debug_results_enabled") private var debugResultsEnabled: Bool = false
     #endif
@@ -24,6 +28,7 @@ struct SettingsView: View {
             VStack(alignment: .leading, spacing: 28) {
                 headerSection
                 appSection
+                proSection
                 dataSection
                 legalSection
                 aboutSection
@@ -40,6 +45,10 @@ struct SettingsView: View {
         .navigationTitle("Settings")
         .navigationBarTitleDisplayMode(.inline)
         .preferredColorScheme(.dark)
+        .sheet(isPresented: $showPaywall) {
+            PaywallView()
+                .environmentObject(subscriptionManager)
+        }
         .alert("Clear History?", isPresented: $showClearConfirmation) {
             Button("Cancel", role: .cancel) {}
             Button("Clear", role: .destructive) {
@@ -121,23 +130,118 @@ struct SettingsView: View {
         }
     }
 
+    // MARK: - Pro
+
+    private var proSection: some View {
+        SettingsSectionCard(title: "Pro") {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(alignment: .center, spacing: 10) {
+                    Image(systemName: "star.circle.fill")
+                        .font(.title2)
+                        .foregroundStyle(AppColors.accent)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("FitCheckAI Pro")
+                            .font(.headline)
+                            .foregroundStyle(.white)
+                        Text("Unlock unlimited analyses")
+                            .font(.subheadline)
+                            .foregroundStyle(AppColors.mutedText)
+                    }
+                    Spacer()
+                    Text(subscriptionManager.isSubscribed ? "Active" : "Not Subscribed")
+                        .font(.caption)
+                        .fontWeight(.semibold)
+                        .foregroundStyle(subscriptionManager.isSubscribed ? AppColors.scoreHigh : AppColors.mutedText)
+                }
+
+                if !subscriptionManager.isSubscribed {
+                    Button {
+                        showPaywall = true
+                    } label: {
+                        HStack(spacing: 8) {
+                            Image(systemName: "sparkles")
+                                .font(.caption)
+                            Text("Upgrade to Pro")
+                                .font(.subheadline)
+                                .fontWeight(.semibold)
+                        }
+                        .foregroundStyle(.white)
+                        .frame(maxWidth: .infinity, alignment: .center)
+                        .padding(.vertical, 10)
+                        .background(
+                            RoundedRectangle(cornerRadius: 12)
+                                .fill(AppColors.accent)
+                        )
+                    }
+                    .buttonStyle(PlainPressableStyle())
+                }
+
+                HStack(spacing: 16) {
+                    Button {
+                        Task {
+                            try? await AppStore.sync()
+                        }
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "arrow.clockwise")
+                                .font(.caption)
+                            Text("Restore Purchases")
+                                .font(.subheadline)
+                                .fontWeight(.medium)
+                        }
+                        .foregroundStyle(AppColors.accent)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.vertical, 8)
+                    }
+                    .buttonStyle(PlainPressableStyle())
+
+                    Button {
+                        if let url = URL(string: "https://apps.apple.com/account/subscriptions") {
+                            openURL(url)
+                        }
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "person.crop.circle.badge.checkmark")
+                                .font(.caption)
+                            Text("Manage Subscription")
+                                .font(.subheadline)
+                                .fontWeight(.medium)
+                        }
+                        .foregroundStyle(AppColors.mutedText)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.vertical, 8)
+                    }
+                    .buttonStyle(PlainPressableStyle())
+                }
+            }
+        }
+    }
+
     // MARK: - Legal
 
     private var legalSection: some View {
         SettingsSectionCard(title: "Legal") {
             VStack(alignment: .leading, spacing: 0) {
-                settingsLinkRow(title: "Privacy Policy", urlString: "https://example.com/privacy")
+                settingsLinkRow(
+                    title: "Privacy Policy",
+                    urlString: "https://drumzkick-netizen.github.io/FitCheckAI/privacy.html"
+                )
                 Divider()
                     .background(Color.white.opacity(0.08))
                     .padding(.vertical, 6)
-                settingsLinkRow(title: "Terms of Use", urlString: "https://example.com/terms")
+                settingsLinkRow(
+                    title: "Terms of Use",
+                    urlString: "https://drumzkick-netizen.github.io/FitCheckAI/terms.html"
+                )
             }
         }
     }
 
     private func settingsLinkRow(title: String, urlString: String) -> some View {
-        let url = URL(string: urlString) ?? URL(string: "https://example.com")!
-        return Link(destination: url) {
+        let url = URL(string: urlString) ?? URL(string: "https://drumzkick-netizen.github.io/FitCheckAI")!
+        return Button {
+            openURL(url)
+        } label: {
             HStack {
                 Text(title)
                     .font(.subheadline)
@@ -149,6 +253,7 @@ struct SettingsView: View {
             }
             .padding(.vertical, 2)
         }
+        .buttonStyle(PlainPressableStyle())
     }
 
     // MARK: - About
@@ -156,10 +261,7 @@ struct SettingsView: View {
     private var aboutSection: some View {
         SettingsSectionCard(title: "About") {
             VStack(alignment: .leading, spacing: 8) {
-                Text(AppBrand.shortAboutText)
-                    .font(.subheadline)
-                    .foregroundStyle(AppColors.mutedText)
-                Text("Get confident feedback before you post or send.")
+                Text("FitCheckAI analyzes outfit photos and provides AI-powered style feedback so you can improve your look before posting or heading out.")
                     .font(.caption)
                     .foregroundStyle(AppColors.mutedText.opacity(0.85))
             }

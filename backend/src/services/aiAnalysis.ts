@@ -334,7 +334,7 @@ Ignore the background and camera composition unless they directly prevent the ou
 
 SECTION GUIDANCE
 What Works: Emphasize flattering fit, strong silhouette, clean proportions, cohesive styling, and visible outfit strengths on the person.
-Could Improve: Emphasize weak fit, shapelessness, imbalance, awkward proportion, and visible styling mismatches.
+Could Improve: Emphasize weak fit, shapelessness, imbalance, awkward proportion, and visible styling mismatches. When deciding what to highlight, internally consider which area appears relatively weakest for this photo: composition (fit, silhouette, proportion), presentation (color, styling, layering), or purpose fit (how well the look matches the stated purpose). At least one improvement item should naturally explain that weakest area in plain language, without mentioning scores or category names.
 Suggestions: Suggest ways to improve shape, balance, proportion, styling, or visible coordination. Suggestions should feel like a stylist improving the outfit, not a photographer improving the image.
 
 TONE
@@ -356,6 +356,16 @@ Keys: person_visible (boolean), body_crop_type (full_body|upper_body|mid_body|cl
 7) improvementSuggestions: 0–3 outfit-only (same rules as suggestions). No photography or environment advice.`;
 
 function getCombinedUserPrompt(purpose: PhotoPurpose): string {
+  if (purpose === "outfit") {
+    return [
+      "Analyze this outfit image. Purpose: outfit.",
+      "When writing feedback:",
+      "- Every feedback item MUST reference at least one visible clothing item or color in the image (for example: hoodie, jacket, shirt, jeans, sneakers, black shirt, teal hoodie).",
+      "- Avoid generic phrases like 'the outfit looks good' or 'the silhouette works well' unless the sentence also mentions a specific clothing item.",
+      "- Write feedback like a stylist describing what they actually see in the image.",
+      'Reply with one JSON: { "visible_facts": {...}, "strengths": [], "improvements": [], "suggestions": [], "analysisTips": [], "improvementSuggestions": [] }.'
+    ].join(" ");
+  }
   return `Analyze this outfit image. Purpose: ${purpose}. Reply with one JSON: { "visible_facts": {...}, "strengths": [], "improvements": [], "suggestions": [], "analysisTips": [], "improvementSuggestions": [] }.`;
 }
 
@@ -601,6 +611,13 @@ function overallFromSubscores(subscores: AnalysisSubscores): number {
     subscores.purposeFit * SUBSCORE_WEIGHTS.purposeFit +
     subscores.lighting * SUBSCORE_WEIGHTS.lighting;
   return roundToOneDecimal(weighted);
+}
+
+/** Apply a small human-like micro-variance to the final overall score without changing subscores or core scoring logic. */
+function applyScoreMicroVariance(baseScore: number): number {
+  const delta = Math.random() * 0.4 - 0.2; // [-0.2, +0.2)
+  const adjusted = baseScore + delta;
+  return roundToOneDecimal(adjusted);
 }
 
 const SUBSCORE_LABELS: Record<keyof AnalysisSubscores, string> = {
@@ -1428,7 +1445,8 @@ export async function analyzePhotoWithAI(
     }
 
     // Single OpenAI round-trip: visible_facts + strengths/improvements/suggestions in one response.
-    const fullAnalysisDetail = "low";
+    // Use "auto" detail so the model can choose an appropriate resolution for clothing detection.
+    const fullAnalysisDetail = "auto";
     const singleRequestMaxTokens = 350;
 
     const tOpenAI0 = Date.now();
@@ -1518,11 +1536,13 @@ export async function analyzePhotoWithAI(
     const derivedSubscores = visibleFactsFromFallback
       ? subscoresFromScore(6.5)
       : deriveSubscoresFromFacts(visibleFacts, purpose);
-    const derivedScore = overallFromSubscores(derivedSubscores);
+    const baseScore = overallFromSubscores(derivedSubscores);
+    const finalScore = applyScoreMicroVariance(baseScore);
     console.log(`${LOG_PREFIX} derived scores from visible facts`, {
       purpose,
       subscores: derivedSubscores,
-      score: derivedScore,
+      baseScore,
+      finalScore,
     });
 
     if (debugInfo) {
@@ -1544,7 +1564,7 @@ export async function analyzePhotoWithAI(
       };
       debugInfo.evaluability = classifyEvaluability(visibleFacts);
       debugInfo.derivedSubscores = derivedSubscores;
-      debugInfo.derivedScore = derivedScore;
+      debugInfo.derivedScore = baseScore;
       debugInfo.visibleFactsFromFallback = visibleFactsFromFallback;
     }
 
@@ -1584,6 +1604,14 @@ export async function analyzePhotoWithAI(
     suggestionsFiltered = dropCrossSectionDuplicates(suggestionsFiltered, improvementsFiltered);
     const analysisTipsSanitized = sanitizeFeedbackItems(analysisTips);
     let improvementSuggestionsSanitized = sanitizeFeedbackItems(improvementSuggestions).slice(0, 5);
+    if (purpose === "improveFit") {
+      console.log(`${LOG_PREFIX} improve_fit raw suggestion buckets`, {
+        strengths_raw: strengths.length,
+        improvements_raw: improvements.length,
+        suggestions_raw: suggestions.length,
+        improvementSuggestions_raw: improvementSuggestions.length,
+      });
+    }
 
     // HARD filter: never allow photo/scene critique phrases in outfit feedback sections.
     strengthsFiltered = strengthsFiltered.filter((s) => !isPhotoCritiqueFeedback(s));
@@ -1680,7 +1708,7 @@ export async function analyzePhotoWithAI(
       isValid: true,
       validationMessage: null,
       reason: null,
-      score: derivedScore,
+      score: finalScore,
       subscores: derivedSubscores,
       scoreExplanation: deriveScoreExplanation(derivedSubscores),
       strengths: strengthsFiltered,

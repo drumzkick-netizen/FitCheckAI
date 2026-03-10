@@ -8,9 +8,11 @@ import UIKit
 /// Resizes and compresses images before upload to keep request size within backend limits and improve reliability.
 enum ImageUploadPreparer {
     /// Max length of the longest side after resize. Keeps enough detail for outfit analysis while reducing payload.
-    static let maxDimension: CGFloat = 1600
+    /// 1200px is a sweet spot: plenty of detail for clothing fit/silhouette while keeping file size modest.
+    static let maxDimension: CGFloat = 1200
     /// JPEG compression quality (0...1). Balances size and visual quality for analysis.
-    static let jpegQuality: CGFloat = 0.82
+    /// ~0.7 keeps outfit details clear while cutting bytes vs the previous 0.82 setting.
+    static let jpegQuality: CGFloat = 0.72
 
     /// Resizes the image so the longest side is at most `maxDimension` and compresses as JPEG.
     /// Use this before sending image data to /analyze-photo to avoid PayloadTooLargeError.

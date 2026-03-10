@@ -7,8 +7,10 @@ import SwiftUI
 
 @main
 struct FitCheckAIApp: App {
+    @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var flowViewModel = AppFlowViewModel()
     @StateObject private var historyViewModel = HistoryViewModel()
+    @StateObject private var subscriptionManager = SubscriptionManager.shared
     @State private var showSplash = true
 
     init() {
@@ -22,6 +24,7 @@ struct FitCheckAIApp: App {
                 RootView()
                     .environmentObject(flowViewModel)
                     .environmentObject(historyViewModel)
+                    .environmentObject(subscriptionManager)
                 if showSplash {
                     SplashView()
                         .transition(.opacity)

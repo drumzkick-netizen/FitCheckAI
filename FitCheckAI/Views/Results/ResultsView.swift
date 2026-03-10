@@ -60,6 +60,23 @@ struct ResultsView: View {
         flowViewModel.latestResult != nil
     }
 
+    private func overallScoreLabel(for score: Double) -> String? {
+        switch score {
+        case 9.0...10.0:
+            return "Elite Fit"
+        case 8.0..<9.0:
+            return "Excellent Look"
+        case 7.0..<8.0:
+            return "Strong Outfit"
+        case 5.5..<7.0:
+            return "Good Casual Fit"
+        case 4.0..<5.5:
+            return "Needs Refinement"
+        default:
+            return "Try a Different Look"
+        }
+    }
+
     private func scoreColor(for score: Double) -> Color {
         switch score {
         case 9...10: return AppColors.scoreHigh
@@ -82,7 +99,9 @@ struct ResultsView: View {
                     }
                     if let purpose = flowViewModel.selectedPurpose {
                         purposePill(purpose)
-                    }
+                }
+                overallScoreCard(result)
+                if !result.strengths.isEmpty {
                     feedbackSectionCard(
                         title: "What Works",
                         icon: "checkmark.circle.fill",
@@ -90,6 +109,8 @@ struct ResultsView: View {
                         color: AppColors.scoreHigh,
                         stagger: ResultsLayout.sectionStagger * 1.5
                     )
+                }
+                if !result.improvements.isEmpty {
                     feedbackSectionCard(
                         title: "Could Improve",
                         icon: "arrow.up.circle.fill",
@@ -97,27 +118,31 @@ struct ResultsView: View {
                         color: AppColors.scoreMid,
                         stagger: ResultsLayout.sectionStagger * 2
                     )
+                }
+                let displaySuggestions = suggestionsForDisplay(result)
+                if !displaySuggestions.isEmpty {
                     feedbackSectionCard(
                         title: "Suggestions",
                         icon: "lightbulb.fill",
-                        items: suggestionsForDisplay(result),
+                        items: displaySuggestions,
                         color: AppColors.scoreLow,
                         stagger: ResultsLayout.sectionStagger * 2.5
                     )
-                    breakdownSection(result)
-                    tipsForBetterAnalysisSection
-                    howToImproveSection
-                    #if DEBUG
-                    if debugResultsEnabled {
-                        debugSection(result)
+                }
+                breakdownSection(result)
+                tipsForBetterAnalysisSection
+                howToImproveSection
+                #if DEBUG
+                if debugResultsEnabled {
+                    debugSection(result)
                     }
                     #endif
                 } else {
                     if let image = flowViewModel.selectedImage {
                         heroImageCard(image)
                     }
-                    if flowViewModel.selectedPurpose != nil {
-                        purposePill(flowViewModel.selectedPurpose!)
+                    if let purpose = flowViewModel.selectedPurpose {
+                        purposePill(purpose)
                     }
                     emptyStateView
                 }
@@ -163,11 +188,16 @@ struct ResultsView: View {
             Text(shareErrorMessage ?? "Something went wrong. Try again later.")
         }
         .alert("Improve My Fit", isPresented: Binding(get: { improveErrorMessage != nil }, set: { if !$0 { improveErrorMessage = nil } })) {
-            Button("OK") {
+            Button("Try Another Photo") {
                 improveErrorMessage = nil
             }
         } message: {
-            Text(improveErrorMessage ?? "Something went wrong. Try again.")
+            VStack(spacing: 12) {
+                Image(systemName: "lightbulb.fill")
+                    .font(.largeTitle)
+                    .foregroundStyle(AppColors.accent)
+                Text("This photo doesn’t show enough of the outfit to suggest specific tweaks.\nTry a full-body shot or step back so the clothing is easier to evaluate.")
+            }
         }
     }
 
@@ -360,6 +390,36 @@ struct ResultsView: View {
             .opacity(revealContent ? 1 : 0)
             .offset(y: revealContent ? 0 : 6)
             .animation(.easeOut(duration: 0.3).delay(0.05), value: revealContent)
+    }
+
+    // MARK: - Overall Outfit Score card
+    private func overallScoreCard(_ result: AnalysisResult) -> some View {
+        let color = scoreColor(for: result.score)
+        let label = overallScoreLabel(for: result.score)
+
+        return VStack(spacing: 12) {
+            Text("Outfit Score")
+                .font(.headline)
+                .fontWeight(.semibold)
+                .foregroundStyle(.white)
+
+            Text(ScoreFormat.display(result.score))
+                .font(.system(size: 56, weight: .bold))
+                .foregroundStyle(color)
+
+            if let label {
+                Text(label)
+                    .font(.subheadline)
+                    .fontWeight(.bold)
+                    .foregroundStyle(AppColors.mutedText)
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 20)
+        .glassCard(padding: 24, cornerRadius: ResultsLayout.cardCornerRadius)
+        .opacity(revealContent ? 1 : 0)
+        .offset(y: revealContent ? 0 : 8)
+        .animation(.easeOut(duration: 0.35).delay(ResultsLayout.sectionStagger * 1.1), value: revealContent)
     }
 
     // MARK: - New Personal Best (when score beats saved best)
@@ -576,7 +636,7 @@ struct ResultsView: View {
 
     // MARK: - Actions (grouped, clear hierarchy)
     private var actionsSection: some View {
-        VStack(alignment: .leading, spacing: 16) {
+        VStack(alignment: .leading, spacing: 20) {
             Text("Actions")
                 .font(.subheadline)
                 .fontWeight(.semibold)
@@ -603,7 +663,8 @@ struct ResultsView: View {
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 12)
             }
-            VStack(spacing: 12) {
+            // Primary + secondary actions
+            VStack(spacing: 10) {
                 Button {
                     AnalyticsService.log(.shareScoreCard)
                     shareScoreCard()
@@ -619,6 +680,7 @@ struct ResultsView: View {
 
                 Button {
                     AnalyticsService.log(.improveMyFitTapped)
+                    print("[ResultsView] Improve My Fit button tapped")
                     requestImproveFit()
                 } label: {
                     Label("Improve My Fit", systemImage: "arrow.up.circle")
@@ -629,41 +691,54 @@ struct ResultsView: View {
                 .buttonStyle(BorderedPressableStyle(tint: AppColors.accent))
                 .disabled(flowViewModel.selectedImageData == nil || isLoadingImprove)
                 .opacity(flowViewModel.selectedImageData != nil && !isLoadingImprove ? 1 : 0.6)
+            }
 
+            // Tertiary action
+            VStack(spacing: 8) {
                 Button {
                     AnalyticsService.log(.beatYourScoreStarted)
                     flowViewModel.clearBeatScoreState()
                     flowViewModel.navigationPath.append(.beatYourScore)
                 } label: {
                     Label("Beat Your Score", systemImage: "arrow.trianglehead.2.forward")
-                        .font(.headline)
+                        .font(.subheadline)
                         .frame(maxWidth: .infinity)
-                        .padding(.vertical, 16)
+                        .padding(.vertical, 14)
                 }
-                .buttonStyle(BorderedPressableStyle(tint: AppColors.accent))
+                .buttonStyle(BorderedPressableStyle(tint: AppColors.mutedText))
                 .disabled(!canShare)
-                .opacity(canShare ? 1 : 0.6)
-
-                Button("Start Over") {
-                    flowViewModel.resetFlow()
-                    flowViewModel.requestedTabIndex = 0
-                }
-                .buttonStyle(PrimaryButtonStyle())
+                .opacity(canShare ? 0.9 : 0.5)
             }
+
+            // Lower-emphasis utility action
+            Button {
+                flowViewModel.resetFlow()
+                flowViewModel.requestedTabIndex = 0
+            } label: {
+                Text("Start Over")
+                    .font(.subheadline)
+                    .fontWeight(.regular)
+                    .foregroundStyle(AppColors.mutedText)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 10)
+            }
+            .buttonStyle(.plain)
         }
         .padding(.top, 8)
     }
 
     private func requestImproveFit() {
         guard let imageData = flowViewModel.selectedImageData else { return }
+        let runId = UUID().uuidString
+        print("[ResultsView] Improve My Fit request starting (runId=\(runId))")
         improveErrorMessage = nil
         improveSuggestions = nil
         isLoadingImprove = true
         let service = APIPhotoAnalysisService()
         Task {
-            defer { Task { @MainActor in isLoadingImprove = false } }
             do {
                 let outcome = try await service.analyzePhoto(imageData: imageData, purpose: .improveFit)
+                print("[ResultsView] Improve My Fit response received (runId=\(runId))")
                 await MainActor.run {
                     switch outcome {
                     case .valid(let analysisResult):
@@ -676,19 +751,32 @@ struct ResultsView: View {
                         } else {
                             list = analysisResult.suggestions
                         }
-                        improveSuggestions = list.isEmpty ? nil : list
+                        if list.isEmpty {
+                            print("[ResultsView] Improve My Fit returned empty suggestions (runId=\(runId))")
+                            improveSuggestions = nil
+                            improveErrorMessage = "We couldn’t find specific outfit tweaks from this photo. Try a different look or angle."
+                        } else {
+                            improveSuggestions = list
+                            print("[ResultsView] Improve My Fit suggestions count=\(list.count) (runId=\(runId))")
+                        }
                     case .invalid(let message):
                         // Avoid showing the generic "suitable for analysis" message for Improve My Fit; the photo was already analyzed.
                         let displayMessage = message.trimmingCharacters(in: .whitespacesAndNewlines).lowercased().contains("doesn't appear suitable for analysis")
                             ? "Couldn't get improvement suggestions. Please try again."
                             : message
                         improveErrorMessage = displayMessage
+                        print("[ResultsView] Improve My Fit invalid outcome (runId=\(runId)) — message: \(displayMessage)")
                     }
                 }
             } catch {
                 await MainActor.run {
                     improveErrorMessage = error.localizedDescription
+                    print("[ResultsView] Improve My Fit request failed (runId=\(runId)) — error: \(error.localizedDescription)")
                 }
+            }
+            await MainActor.run {
+                isLoadingImprove = false
+                print("[ResultsView] Improve My Fit UI updated (runId=\(runId)); isLoadingImprove=false")
             }
         }
     }
