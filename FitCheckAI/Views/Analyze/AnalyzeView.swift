@@ -343,7 +343,7 @@ struct AnalyzeView: View {
 
 #Preview {
     NavigationStack {
-        AnalyzeView(service: MockPhotoAnalysisService())
+        AnalyzeView(service: APIPhotoAnalysisService())
             .environmentObject(AppFlowViewModel())
             .environmentObject(HistoryViewModel())
     }

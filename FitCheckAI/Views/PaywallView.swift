@@ -34,17 +34,32 @@ struct PaywallView: View {
     }
 
     var body: some View {
-        VStack(spacing: 24) {
-            headerSection
-            blurredPreviewSection
-            benefitsSection
-            plansSection
-            primaryButton
-            footerLinks
+        ZStack(alignment: .topTrailing) {
+            VStack(spacing: 24) {
+                headerSection
+                blurredPreviewSection
+                benefitsSection
+                plansSection
+                primaryButton
+                footerLinks
+            }
+            .padding(.horizontal, 24)
+            .padding(.top, 32)
+            .padding(.bottom, 32)
+
+            Button {
+                dismiss()
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.headline)
+                    .foregroundStyle(.white)
+                    .padding(8)
+                    .background(Color.black.opacity(0.5))
+                    .clipShape(Circle())
+            }
+            .padding(.trailing, 20)
+            .padding(.top, 16)
         }
-        .padding(.horizontal, 24)
-        .padding(.top, 32)
-        .padding(.bottom, 32)
         .background(AppBackground())
         .preferredColorScheme(.dark)
         .task {
@@ -274,7 +289,7 @@ struct PaywallView: View {
                     _ = await subscriptionManager.purchase(product)
                 }
             } label: {
-                Text("Start 3-Day Free Trial")
+                Text(ctaTitle(for: selectedProduct))
                     .font(.headline)
                     .fontWeight(.semibold)
                     .frame(maxWidth: .infinity)
@@ -286,8 +301,13 @@ struct PaywallView: View {
             .disabled(subscriptionManager.isLoading || selectedProduct == nil)
             .opacity(subscriptionManager.isLoading ? 0.7 : 1)
 
-            if let product = trialPricingProduct {
-                Text(trialPriceLine(for: product))
+            if let pricingProduct = pricingProductForCTA {
+                Text(ctaSubtitle(for: pricingProduct))
+                    .font(.caption)
+                    .foregroundStyle(AppColors.mutedText)
+                    .frame(maxWidth: .infinity, alignment: .center)
+            } else {
+                Text("Free trial, then subscription renews automatically.")
                     .font(.caption)
                     .foregroundStyle(AppColors.mutedText)
                     .frame(maxWidth: .infinity, alignment: .center)
@@ -295,17 +315,30 @@ struct PaywallView: View {
         }
     }
 
-    /// Prefer the monthly product for the post-trial price line; fall back to selected product.
-    private var trialPricingProduct: Product? {
-        if let monthly = products.first(where: { $0.id == "fitcheckai.pro.monthly" }) {
-            return monthly
+    /// Prefer the currently selected product; if none, fall back to the monthly plan for price display.
+    private var pricingProductForCTA: Product? {
+        if let selectedProduct {
+            return selectedProduct
         }
-        return selectedProduct
+        return products.first(where: { $0.id == "com.kevinperalta.fitcheckaiapp.pro.monthly" }) ?? products.first
     }
 
-    private func trialPriceLine(for product: Product) -> String {
+    private func hasIntroTrial(_ product: Product) -> Bool {
+        product.subscription?.introductoryOffer != nil
+    }
+
+    private func ctaTitle(for product: Product?) -> String {
+        guard let product else { return "Subscribe" }
+        return hasIntroTrial(product) ? "Start 3-Day Free Trial" : "Subscribe Now"
+    }
+
+    private func ctaSubtitle(for product: Product) -> String {
         let priceText = pricePerPeriod(for: product)
-        return "\(priceText) after trial"
+        if hasIntroTrial(product) {
+            return "\(priceText) after trial"
+        } else {
+            return "\(priceText) until cancelled"
+        }
     }
 
     // MARK: - Footer links
@@ -347,13 +380,24 @@ struct PaywallView: View {
                 }
                 .buttonStyle(.plain)
             }
-            Text("3-day free trial, then auto-renews until cancelled. Manage your subscription anytime in iPhone Settings.")
-                .font(.caption2)
-                .foregroundStyle(AppColors.mutedText.opacity(0.9))
-                .multilineTextAlignment(.center)
-                .padding(.top, 4)
+            if let pricingProduct = pricingProductForCTA {
+                Text(legalLine(for: pricingProduct))
+                    .font(.caption2)
+                    .foregroundStyle(AppColors.mutedText.opacity(0.9))
+                    .multilineTextAlignment(.center)
+                    .padding(.top, 4)
+            }
         }
         .frame(maxWidth: .infinity)
+    }
+
+    private func legalLine(for product: Product) -> String {
+        let priceText = pricePerPeriod(for: product)
+        if hasIntroTrial(product) {
+            return "Free trial, then \(priceText) until cancelled. Manage your subscription anytime in iPhone Settings."
+        } else {
+            return "\(priceText) until cancelled. Manage your subscription anytime in iPhone Settings."
+        }
     }
 }
 

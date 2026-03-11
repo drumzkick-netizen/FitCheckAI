@@ -218,7 +218,7 @@ struct CompareAnalyzeView: View {
 
 #Preview {
     NavigationStack {
-        CompareAnalyzeView(service: MockPhotoAnalysisService())
+        CompareAnalyzeView(service: APIPhotoAnalysisService())
             .environmentObject(AppFlowViewModel())
     }
 }

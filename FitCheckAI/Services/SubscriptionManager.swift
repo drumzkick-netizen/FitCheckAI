@@ -20,9 +20,9 @@ final class SubscriptionManager: ObservableObject {
     private let freeAnalysesKey = "fitcheck_free_analyses_used"
 
     private let productIds: [String] = [
-        "fitcheckai.pro.weekly",
-        "fitcheckai.pro.monthly",
-        "fitcheckai.pro.yearly"
+        "com.kevinperalta.fitcheckaiapp.pro.weekly",
+        "com.kevinperalta.fitcheckaiapp.pro.monthly",
+        "com.kevinperalta.fitcheckaiapp.pro.yearly"
     ]
 
     var canAnalyze: Bool {
